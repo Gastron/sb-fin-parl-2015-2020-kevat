@@ -1,0 +1,2 @@
+webdataset==0.1.62
+kaldi-io==0.9.4

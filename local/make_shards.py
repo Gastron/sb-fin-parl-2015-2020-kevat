@@ -9,6 +9,9 @@ import queue
 import os
 import pathlib
 import warnings
+import shutil
+import kaldi_io
+import torch
 
 
 def kaldi_map_stream(path):
@@ -57,7 +60,7 @@ def segments_to_output(segments_path, wavscp_path, fade_len=0.005):
 def wavscp_to_output(wavscp_path):
     for uttid, wavdata in kaldi_map_stream(wavscp_path):
         signal, samplerate = read_rxwav(wavdata)
-        output = {"audio.pth": signal),
+        output = {"audio.pth": signal,
                 "meta.json": {"samplerate": samplerate}}
         yield uttid, output
 
@@ -70,6 +73,12 @@ def utt2spk_to_output(utt2spk_path):
     for uttid, data in kaldi_map_stream(utt2spk_path):
         output = {"meta.json": {"spkid":data}}
         yield uttid, output
+
+def featsscp_to_output(featsscp_path):
+    for uttid, feats in kaldi_io.read_mat_scp(featsscp_path):
+        output = {"feats.pth": torch.from_numpy(feats)}
+        yield uttid, output
+
 
 def make_data_point(outputs):
     data_point = {}
@@ -96,12 +105,13 @@ STREAM_FUNCS = {
         "text": text_to_output,
         "segments": segments_to_output,
         "wavscp": wavscp_to_output,
-        "utt2spk": utt2spk_to_output
+        "utt2spk": utt2spk_to_output,
+        "featsscp": featsscp_to_output
 }
 def make_streams(sources):
     streams = []
-    for name, args in sources:
-        stream = STREAM_FUNCS["name"](*args)
+    for name, args in sources.items():
+        stream = STREAM_FUNCS[name](*args)
         streams.append(stream)
     return streams
     
@@ -121,34 +131,39 @@ def write_shards(shard_dir, source_queue):
                 data_point = make_data_point(outputs)
                 fo.write(data_point)
 
-def fill_queue(split_dir):
+def fill_queue(split_dir, feats_mode=False):
     source_queue = mp.Queue()
     root, dirs, files = next(os.walk(split_dir))
     root = pathlib.Path(root)
     for split in dirs:
         splitpath = root / split
         sources = {}
-        #segments / wav.scp
-        if (splitpath / "segments").exists():
-            if not (splitpath / "wav.scp").exists():
-                raise ValueError(f"{splitpath} has segments but not wav.scp")
-            sources["segments"] = (splitpath / "segments", splitpath / "wav.scp")
-        elif (splitpath / "wav.scp").exists():
-            sources["wavscp"] = (splitpath / "wav.scp",)
+        if not feats_mode:
+            #segments / wav.scp
+            if (splitpath / "segments").exists():
+                if not (splitpath / "wav.scp").exists():
+                    raise ValueError(f"{splitpath} has segments but not wav.scp")
+                sources["segments"] = (splitpath / "segments", splitpath / "wav.scp")
+            elif (splitpath / "wav.scp").exists():
+                sources["wavscp"] = (splitpath / "wav.scp",)
+            else:
+                warnings.warn(f"No wav.scp nor segments file in {splitpath}")
         else:
-            warnings.warn(f"No wav.scp nor segments file in {splitpath}")
+            if not (splitpath / "feats.scp").exists():
+                raise ValueError("Requested to use feats.scp but none found!")
+            sources["featsscp"] = (str(splitpath / "feats.scp"),)
         #utt2spk
         if (splitpath / "utt2spk").exists():
-            sources["utt2spk"] = (splitpath / "utt2spk")
+            sources["utt2spk"] = (splitpath / "utt2spk",)
         else:
             warnings.warn(f"No utt2spk file in {splitpath}")
         #text
         if (splitpath / "text").exists():
-            sources["text"] = (splitpath / "text")
+            sources["text"] = (splitpath / "text",)
         else:
             warnings.warn(f"No text file in {splitpath}")
-        queue.put(sources)
-    return queue
+        source_queue.put(sources)
+    return source_queue
 
 def process_queue_in_parallel(source_queue, num_proc, shard_dir):
     shard_dir = pathlib.Path(shard_dir)
@@ -166,6 +181,18 @@ def process_queue_in_parallel(source_queue, num_proc, shard_dir):
     for proc in processes:
         proc.join()
 
+def collect_shards(split_shard_dir, target_dir):
+    shard_split_dir = pathlib.Path(split_shard_dir)
+    target_dir = pathlib.Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    i = 0
+    for shard_dir in shard_split_dir.iterdir():
+        for shard in shard_dir.iterdir():
+            shutil.move(shard, target_dir / ("shard-%06d.tar" % i))
+            i += 1
+        shard_dir.rmdir()
+    shard_split_dir.rmdir()
+
 
 if __name__ == "__main__":
     import argparse
@@ -181,6 +208,12 @@ if __name__ == "__main__":
             help="""The number of processes to use""",
             default=2,
             type=int)
+    parser.add_argument("--feats-mode",
+            help="""Use Kaldi features instead of
+            raw audio""",
+            action="store_true")
     args = parser.parse_args()
-    source_queue = fill_queue(args.split_dir)
-    process_queue_in_parallel(source_queue, args.num_proc, args.shard_dir)
+    source_queue = fill_queue(args.split_dir, feats_mode=args.feats_mode)
+    process_queue_in_parallel(source_queue, args.num_proc, args.shard_dir / "TMP")
+    collect_shards(args.shard_dir / "TMP", args.shard_dir) 
+
