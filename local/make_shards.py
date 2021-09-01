@@ -12,7 +12,11 @@ import warnings
 import shutil
 import kaldi_io
 import torch
-
+try:
+    import simplefst
+    SIMPLEFST = True
+except ImportError:
+    SIMPLEFST = False
 
 def kaldi_map_stream(path):
     with open(path) as fi:
@@ -79,6 +83,31 @@ def featsscp_to_output(featsscp_path):
         output = {"feats.pth": torch.from_numpy(feats)}
         yield uttid, output
 
+def ali_to_output(aliark_path):
+    for uttid, ali in kaldi_io.read_ali_ark(aliark_path):
+        output = {"ali.pth": torch.from_numpy(ali)}
+        yield uttid, output
+
+def graphsscp_to_output(graphscp_path):
+    if not SIMPLEFST:
+        raise ValueError("""Need PyChain for this. 
+        See https://github.com/YiwenShaoStephen/pychain
+        """)
+    for uttid, rxfile in kaldi_map_stream(graphscp_path):
+        basepath, offset = rxfile.rsplit(":", maxsplit=1)
+        graph = simplefst.StdVectorFst.read_ark(basepath, offset)
+        output = {"graph.pickle": graph}
+        yield uttid, output
+
+STREAM_FUNCS = {
+        "text": text_to_output,
+        "segments": segments_to_output,
+        "wavscp": wavscp_to_output,
+        "utt2spk": utt2spk_to_output,
+        "featsscp": featsscp_to_output,
+        "aliark": ali_to_output,
+        "graphsscp": graphsscp_to_output,
+}
 
 def make_data_point(outputs):
     data_point = {}
@@ -101,13 +130,6 @@ def make_data_point(outputs):
     return data_point
 
 
-STREAM_FUNCS = {
-        "text": text_to_output,
-        "segments": segments_to_output,
-        "wavscp": wavscp_to_output,
-        "utt2spk": utt2spk_to_output,
-        "featsscp": featsscp_to_output
-}
 def make_streams(sources):
     streams = []
     for name, args in sources.items():
@@ -131,38 +153,14 @@ def write_shards(shard_dir, source_queue):
                 data_point = make_data_point(outputs)
                 fo.write(data_point)
 
-def fill_queue(split_dir, feats_mode=False):
+def fill_queue(nj, sources):
     source_queue = mp.Queue()
-    root, dirs, files = next(os.walk(split_dir))
-    root = pathlib.Path(root)
-    for split in dirs:
-        splitpath = root / split
-        sources = {}
-        if not feats_mode:
-            #segments / wav.scp
-            if (splitpath / "segments").exists():
-                if not (splitpath / "wav.scp").exists():
-                    raise ValueError(f"{splitpath} has segments but not wav.scp")
-                sources["segments"] = (splitpath / "segments", splitpath / "wav.scp")
-            elif (splitpath / "wav.scp").exists():
-                sources["wavscp"] = (splitpath / "wav.scp",)
-            else:
-                warnings.warn(f"No wav.scp nor segments file in {splitpath}")
-        else:
-            if not (splitpath / "feats.scp").exists():
-                raise ValueError("Requested to use feats.scp but none found!")
-            sources["featsscp"] = (str(splitpath / "feats.scp"),)
-        #utt2spk
-        if (splitpath / "utt2spk").exists():
-            sources["utt2spk"] = (splitpath / "utt2spk",)
-        else:
-            warnings.warn(f"No utt2spk file in {splitpath}")
-        #text
-        if (splitpath / "text").exists():
-            sources["text"] = (splitpath / "text",)
-        else:
-            warnings.warn(f"No text file in {splitpath}")
-        source_queue.put(sources)
+    for jobid in range(1, nj+1):
+        jobsources = {}
+        for name, args in sources.items():
+            jobsources[name] = tuple(arg.replace("JOB", str(jobid))
+                    for arg in args)
+        source_queue.put(jobsources)
     return source_queue
 
 def process_queue_in_parallel(source_queue, num_proc, shard_dir):
@@ -196,24 +194,34 @@ def collect_shards(split_shard_dir, target_dir):
 
 if __name__ == "__main__":
     import argparse
+    import inspect
     parser = argparse.ArgumentParser()
-    parser.add_argument("split_dir", 
-            help="""A Kaldi top-level split dir, 
-            with only data directories as sub-dirs""")
+    parser.add_argument("nj",
+            help="""The number of Kaldi archives,
+            this is called nj (num jobs) after the 
+            Kaldi convention""",
+            type=int)
     parser.add_argument("shard_dir",
             help="""The top-level directory where 
             the shards should go.""",
             type=pathlib.Path)
     parser.add_argument("--num-proc",
             help="""The number of processes to use""",
-            default=2,
+            default=4,
             type=int)
-    parser.add_argument("--feats-mode",
-            help="""Use Kaldi features instead of
-            raw audio""",
-            action="store_true")
+    for name, func in STREAM_FUNCS.items():
+        spec = inspect.getfullargspec(func)
+        if spec.defaults is None:
+            nargs = len(spec.args)
+        else:
+            nargs = len(spec.args) - len(spec.defaults)
+        parser.add_argument(f"--{name}",
+            nargs = nargs,
+            metavar = tuple(spec.args[:nargs])
+        )
     args = parser.parse_args()
-    source_queue = fill_queue(args.split_dir, feats_mode=args.feats_mode)
+    sources = {name: getattr(args,name) for name in STREAM_FUNCS
+                if getattr(args,name) is not None}
+    source_queue = fill_queue(args.nj, sources)
     process_queue_in_parallel(source_queue, args.num_proc, args.shard_dir / "TMP")
     collect_shards(args.shard_dir / "TMP", args.shard_dir) 
-
