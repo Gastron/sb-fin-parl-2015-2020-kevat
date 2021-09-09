@@ -12,11 +12,18 @@ import warnings
 import shutil
 import kaldi_io
 import torch
-try:
-    import simplefst
-    SIMPLEFST = True
-except ImportError:
-    SIMPLEFST = False
+import numpy as np
+import locale
+
+
+# WORKAROUND:
+
+#try:
+#    import simplefst
+#    SIMPLEFST = True
+#except ImportError:
+#    SIMPLEFST = False
+SIMPLEFST = False
 
 def kaldi_map_stream(path):
     with open(path) as fi:
@@ -85,6 +92,9 @@ def featsscp_to_output(featsscp_path):
 
 def ali_to_output(aliark_path):
     for uttid, ali in kaldi_io.read_ali_ark(aliark_path):
+        # This conversion is needed, see:
+        # https://github.com/pytorch/audio/blob/8a347b62cf5c907d2676bdc983354834e500a282/torchaudio/kaldi_io.py#L59-L61
+        ali = np.ascontiguousarray(ali)
         output = {"ali.pth": torch.from_numpy(ali)}
         yield uttid, output
 
@@ -117,7 +127,7 @@ def make_data_point(outputs):
         elif uttid != data_point["__key__"]:
             MSG = "Mismatched key, data probably not "
             MSG += "sorted and filtered the same way! "
-            MSG += "Conflict: {uttid} != {data_point['__key__']}; "
+            MSG += f"Conflict: {uttid} != {data_point['__key__']}; "
             MSG += f"{' '.join(output.keys())} did not "
             MSG += f"match with {' '.join(data_point.keys())}"
             raise RuntimeError(MSG)
@@ -138,18 +148,59 @@ def make_streams(sources):
     return streams
     
 
-def write_shards(shard_dir, source_queue):
+
+def sync_streams(streams, maxskip=100):
+    skipped = 0
+    buffers = [None for stream in streams]
+    while True:
+        for i, buf in enumerate(buffers):
+            if buf is None:
+                try:
+                    buffers[i] = (next(streams[i]))
+                except StopIteration:
+                    return
+        # NOTE:
+        # Kaldi convention is to use the C locale.
+        # It could happen that you require a different
+        # locale for running this script (as you might have
+        # text in UTF-8 encoding for example).
+        # By design this does naive comparison (not locale-aware),
+        # which should match the C locale, as far as I know.
+        key_to_keep = max(key for key, value in buffers)
+        for i, (key, value) in enumerate(buffers):
+            if key != key_to_keep:
+                buffers[i] = None
+        if all(buf is not None for buf in buffers):
+            yield buffers
+            buffers = [None for stream in streams]
+            skipped = 0
+        else:
+            skipped += 1
+            if skipped > maxskip:
+                MSG = "Skipped too many partially available utterances!"
+                raise RuntimeError(MSG)
+            
+
+SHARD_DEFAULTS = {
+        "maxcount":100000,
+        "maxsize": 3e9,
+        "compress": True,
+}
+
+
+
+def write_shards(shard_dir, source_queue, shard_kwargs=SHARD_DEFAULTS):
     shard_dir = pathlib.Path(shard_dir)
     shard_dir.mkdir(parents=True)
     shardpattern = f"{shard_dir}/shard-%06d.tar"
-    with wds.ShardWriter(shardpattern, maxcount=500) as fo:
+    with wds.ShardWriter(shardpattern, **shard_kwargs) as fo:
         while True:
             try:
                 sources = source_queue.get(False)
             except queue.Empty:
                 break
             streams = make_streams(sources)
-            for outputs in zip(*streams):
+            for outputs in sync_streams(streams):
                 data_point = make_data_point(outputs)
                 fo.write(data_point)
 
@@ -163,21 +214,32 @@ def fill_queue(nj, sources):
         source_queue.put(jobsources)
     return source_queue
 
-def process_queue_in_parallel(source_queue, num_proc, shard_dir):
+def process_queue_in_parallel(num_proc, shard_dir, source_queue, shard_kwargs=SHARD_DEFAULTS):
     shard_dir = pathlib.Path(shard_dir)
     processes = []
-    for i in range(num_proc):
-        proc = mp.Process(
-                target=write_shards,
-                kwargs={
-                    "shard_dir": shard_dir / str(i),
-                    "source_queue": source_queue
-                }
+    if num_proc > 0:
+        for i in range(num_proc):
+            proc = mp.Process(
+                    target=write_shards,
+                    kwargs={
+                        "shard_dir": shard_dir / str(i),
+                        "source_queue": source_queue,
+                        "shard_kwargs": shard_kwargs
+                    }
+            )
+            proc.start()
+            processes.append(proc)
+        for proc in processes:
+            proc.join()
+    else:
+        # No parallel processing, use this process!
+        write_shards(
+                shard_dir = shard_dir / "0",
+                source_queue = source_queue,
+                shard_kwargs = shard_kwargs
         )
-        proc.start()
-        processes.append(proc)
-    for proc in processes:
-        proc.join()
+
+
 
 def collect_shards(split_shard_dir, target_dir):
     shard_split_dir = pathlib.Path(split_shard_dir)
@@ -193,6 +255,10 @@ def collect_shards(split_shard_dir, target_dir):
 
 
 if __name__ == "__main__":
+    # workaround:
+    import ctypes
+    libgcc_s = ctypes.CDLL("libgcc_s.so.1")
+
     import argparse
     import inspect
     parser = argparse.ArgumentParser()
@@ -219,9 +285,15 @@ if __name__ == "__main__":
             nargs = nargs,
             metavar = tuple(spec.args[:nargs])
         )
+    for name, default in SHARD_DEFAULTS.items():
+        parser.add_argument(f"--shard-{name}",
+                default=default,
+                type=type(default)
+        )
     args = parser.parse_args()
     sources = {name: getattr(args,name) for name in STREAM_FUNCS
                 if getattr(args,name) is not None}
+    shard_kwargs = {name: getattr(args, f"shard_{name}") for name in SHARD_DEFAULTS}
     source_queue = fill_queue(args.nj, sources)
-    process_queue_in_parallel(source_queue, args.num_proc, args.shard_dir / "TMP")
+    process_queue_in_parallel(args.num_proc, args.shard_dir / "TMP", source_queue, shard_kwargs)
     collect_shards(args.shard_dir / "TMP", args.shard_dir) 
