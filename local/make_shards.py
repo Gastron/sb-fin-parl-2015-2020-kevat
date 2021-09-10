@@ -14,6 +14,7 @@ import kaldi_io
 import torch
 import numpy as np
 import locale
+import more_itertools
 
 
 # WORKAROUND:
@@ -39,10 +40,10 @@ def kaldi_map_stream(path):
 def read_rxwav(data):
     if data.endswith("|"):
         with subprocess.Popen(data, shell=True, stdout=subprocess.PIPE) as proc:
-            signal, samplerate = torchaudio.load(proc.stdout, channels_first=False)
+            signal, samplerate = torchaudio.load(proc.stdout)
     else:
-        signal, samplerate = torchaudio.load(data, channels_first=False)
-    return signal, samplerate
+        signal, samplerate = torchaudio.load(data)
+    return signal.squeeze(0), samplerate
 
 def segments_to_output(segments_path, wavscp_path, fade_len=0.005):
     wavscp = dict(kaldi_map_stream(wavscp_path))
@@ -109,6 +110,80 @@ def graphsscp_to_output(graphscp_path):
         output = {"graph.pickle": graph}
         yield uttid, output
 
+
+def sync_streams(streams, maxskip=100):
+    streams = [more_itertools.peekable(stream) for stream in streams]
+    skipped = 0
+    duplicated = 0
+    buffers = [None for stream in streams]
+    while True:
+        for i, buf in enumerate(buffers):
+            if buf is None:
+                try:
+                    buffers[i] = next(streams[i])
+                except StopIteration:
+                    return
+        # NOTE:
+        # Kaldi convention is to use the C locale.
+        # It could happen that you require a different
+        # locale for running this script (as you might have
+        # text in UTF-8 encoding for example).
+        # By design this does naive comparison (not locale-aware),
+        # which should match the C locale, as far as I know.
+        key_to_keep = max(key for key, value in buffers)
+        for i, (key, value) in enumerate(buffers):
+            if key != key_to_keep:
+                buffers[i] = None
+        if all(buf is not None for buf in buffers):
+            # Allowing duplicates requires renaming:
+            if duplicated > 0:
+                yield [(key + f"-{duplicated}", value) 
+                        for (key, value) in buffers]
+            else:
+                yield buffers
+            skipped = 0
+            found_duplicate = False
+            for i, stream in enumerate(streams):
+                if stream.peek((None, None))[0] == key_to_keep:
+                    buffers[i] = None
+                    found_duplicate = True
+            if not found_duplicate:
+                buffers = [None for stream in streams]
+                duplicated = 0
+            else:
+                duplicated += 1
+        else:
+            skipped += 1
+            if skipped > maxskip:
+                MSG = "Skipped too many partially available utterances!"
+                raise RuntimeError(MSG)
+
+
+def feat_ali_chunks_to_output(featsscp_path, aliark_path, chunklen, subsampling, contextlen):
+    chunklen = int(chunklen)
+    subsampling = int(subsampling)
+    contextlen = int(contextlen)
+    ali_chunklen = chunklen // subsampling
+    feat_stream = featsscp_to_output(featsscp_path)
+    ali_stream = ali_to_output(aliark_path)
+    for (key, feats_output), (_, ali_output) in sync_streams([feat_stream, ali_stream]):
+        feats = feats_output['feats.pth']
+        ali = ali_output['ali.pth']
+        padded_feats = torch.cat(
+                (
+                    feats[0].unsqueeze(0).repeat_interleave(contextlen,dim=0),
+                    feats,
+                    feats[-1].unsqueeze(0).repeat_interleave(contextlen,dim=0)
+                )
+        )
+        for i in range(padded_feats.shape[0] // chunklen):
+            feats_chunk = feats[i*chunklen:(i+1)*chunklen,:]
+            ali_chunk = ali[i*ali_chunklen:(i+1)*ali_chunklen]
+            output = {'feats.pth': feats_chunk,
+                    'ali.pth': ali_chunk}
+            yield key, output
+
+
 STREAM_FUNCS = {
         "text": text_to_output,
         "segments": segments_to_output,
@@ -117,7 +192,9 @@ STREAM_FUNCS = {
         "featsscp": featsscp_to_output,
         "aliark": ali_to_output,
         "graphsscp": graphsscp_to_output,
+        "featalichunk": feat_ali_chunks_to_output,
 }
+
 
 def make_data_point(outputs):
     data_point = {}
@@ -147,38 +224,6 @@ def make_streams(sources):
         streams.append(stream)
     return streams
     
-
-
-def sync_streams(streams, maxskip=100):
-    skipped = 0
-    buffers = [None for stream in streams]
-    while True:
-        for i, buf in enumerate(buffers):
-            if buf is None:
-                try:
-                    buffers[i] = (next(streams[i]))
-                except StopIteration:
-                    return
-        # NOTE:
-        # Kaldi convention is to use the C locale.
-        # It could happen that you require a different
-        # locale for running this script (as you might have
-        # text in UTF-8 encoding for example).
-        # By design this does naive comparison (not locale-aware),
-        # which should match the C locale, as far as I know.
-        key_to_keep = max(key for key, value in buffers)
-        for i, (key, value) in enumerate(buffers):
-            if key != key_to_keep:
-                buffers[i] = None
-        if all(buf is not None for buf in buffers):
-            yield buffers
-            buffers = [None for stream in streams]
-            skipped = 0
-        else:
-            skipped += 1
-            if skipped > maxskip:
-                MSG = "Skipped too many partially available utterances!"
-                raise RuntimeError(MSG)
             
 
 SHARD_DEFAULTS = {
@@ -193,16 +238,20 @@ def write_shards(shard_dir, source_queue, shard_kwargs=SHARD_DEFAULTS):
     shard_dir = pathlib.Path(shard_dir)
     shard_dir.mkdir(parents=True)
     shardpattern = f"{shard_dir}/shard-%06d.tar"
+    try:
+        sources = source_queue.get(timeout=5)
+    except queue.Empty:
+        return
     with wds.ShardWriter(shardpattern, **shard_kwargs) as fo:
         while True:
-            try:
-                sources = source_queue.get(False)
-            except queue.Empty:
-                break
             streams = make_streams(sources)
             for outputs in sync_streams(streams):
                 data_point = make_data_point(outputs)
                 fo.write(data_point)
+            try:
+                sources = source_queue.get(timeout=5)
+            except queue.Empty:
+                break
 
 def fill_queue(nj, sources):
     source_queue = mp.Queue()
