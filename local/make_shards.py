@@ -17,15 +17,6 @@ import locale
 import more_itertools
 
 
-# WORKAROUND:
-
-#try:
-#    import simplefst
-#    SIMPLEFST = True
-#except ImportError:
-#    SIMPLEFST = False
-SIMPLEFST = False
-
 def kaldi_map_stream(path):
     with open(path) as fi:
         for line in fi:
@@ -58,7 +49,7 @@ def segments_to_output(segments_path, wavscp_path, fade_len=0.005):
                     wavscp[wav_id]
             )
             current_id = wav_id
-            fade_time = fade_len*current_samplerate
+            fade_time = int(fade_len*current_samplerate)
             current_fader = torchaudio.transforms.Fade(
                     fade_in_len=fade_time, 
                     fade_out_len=fade_time, 
@@ -97,17 +88,6 @@ def ali_to_output(aliark_path):
         # https://github.com/pytorch/audio/blob/8a347b62cf5c907d2676bdc983354834e500a282/torchaudio/kaldi_io.py#L59-L61
         ali = np.ascontiguousarray(ali)
         output = {"ali.pth": torch.from_numpy(ali)}
-        yield uttid, output
-
-def graphsscp_to_output(graphscp_path):
-    if not SIMPLEFST:
-        raise ValueError("""Need PyChain for this. 
-        See https://github.com/YiwenShaoStephen/pychain
-        """)
-    for uttid, rxfile in kaldi_map_stream(graphscp_path):
-        basepath, offset = rxfile.rsplit(":", maxsplit=1)
-        graph = simplefst.StdVectorFst.read_ark(basepath, offset)
-        output = {"graph.pickle": graph}
         yield uttid, output
 
 
@@ -176,8 +156,11 @@ def feat_ali_chunks_to_output(featsscp_path, aliark_path, chunklen, subsampling,
                     feats[-1].unsqueeze(0).repeat_interleave(contextlen,dim=0)
                 )
         )
-        for i in range(padded_feats.shape[0] // chunklen):
-            feats_chunk = feats[i*chunklen:(i+1)*chunklen,:]
+        for i in range(ali.shape[0] // ali_chunklen):
+            feats_chunk = padded_feats[i*chunklen:(i+1)*chunklen+2*contextlen,:]
+            if feats_chunk.shape[0] != (chunklen + 2*contextlen):
+                # Skip chunks with bad boundary conditions :(
+                continue
             ali_chunk = ali[i*ali_chunklen:(i+1)*ali_chunklen]
             output = {'feats.pth': feats_chunk,
                     'ali.pth': ali_chunk}
@@ -191,7 +174,6 @@ STREAM_FUNCS = {
         "utt2spk": utt2spk_to_output,
         "featsscp": featsscp_to_output,
         "aliark": ali_to_output,
-        "graphsscp": graphsscp_to_output,
         "featalichunk": feat_ali_chunks_to_output,
 }
 
@@ -199,6 +181,8 @@ STREAM_FUNCS = {
 def make_data_point(outputs):
     data_point = {}
     for uttid, output in outputs:
+        # HACK: WebDataset cannot handle periods in uttids:
+        uttid = uttid.replace(".", "")
         if "__key__" not in data_point:
             data_point["__key__"] = uttid
         elif uttid != data_point["__key__"]:
@@ -304,10 +288,6 @@ def collect_shards(split_shard_dir, target_dir):
 
 
 if __name__ == "__main__":
-    # workaround:
-    import ctypes
-    libgcc_s = ctypes.CDLL("libgcc_s.so.1")
-
     import argparse
     import inspect
     parser = argparse.ArgumentParser()
