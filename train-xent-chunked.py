@@ -14,6 +14,7 @@ from glob import glob
 import io
 import torchaudio
 import local
+import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,23 @@ class XentAM(sb.Brain):
             self.hparams.model.load_state_dict(model_state_dict)
             self.checkpointer.save_checkpoint(name=f"AVERAGED-{self.hparams.avg_ckpts}")
 
+    def estimate_prior(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
+        self.on_evaluate_start(max_key=max_key, min_key=min_key)
+        dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
+        with torch.no_grad():
+            prior = torch.zeros((self.hparams.num_units,))
+            num_predictions = 0
+            for batch in tqdm.tqdm(dataloader):
+                predictions = self.compute_forward(batch, stage=sb.Stage.TEST) 
+                summed_preds = torch.sum(predictions, dim=(0,1))
+                prior += summed_preds.detach().cpu()
+                num_predictions += predictions.shape[0]*predictions.shape[1]
+            prior = prior / num_predictions
+        return prior
+            
+
+            
+
 
 def dataio_prepare(hparams):
     """This function prepares the datasets to be used in the brain class.
@@ -129,6 +147,7 @@ def dataio_prepare(hparams):
             .batched(hparams["valid_batchsize"], collation_fn=local.Batch)
     )
     return {"train": traindata, "valid": validdata}
+
 
 
 
@@ -176,3 +195,9 @@ if __name__ == "__main__":
         datasets["valid"],
         train_loader_kwargs = hparams["train_loader_kwargs"]
     )
+    prior = asr_brain.estimate_prior(
+            datasets["train"], 
+            loader_kwargs=hparams["prior_loader_kwargs"],
+            max_key=hparams["test_max_key"]
+    )
+    torch.save(prior, hparams["prior_file"])

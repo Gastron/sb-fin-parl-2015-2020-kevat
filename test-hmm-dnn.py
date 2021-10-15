@@ -34,33 +34,37 @@ def setup(hparams, run_opts):
         hparams.checkpointer.load_checkpoint(ckpt)
     return modules, hparams, device
 
-def run_test(modules, hparams, device):
-    with open(hparams.test_probs_out, 'wb') as fo:
-        for uttid, feats in tqdm.tqdm(kaldi_io.read_mat_scp(hparams.test_feats)):
-            feats = torch.from_numpy(feats)
-            padded_feats = torch.cat(
-                    (
-                        feats[0].unsqueeze(0).repeat_interleave(hparams.contextlen,dim=0),
-                        feats,
-                        feats[-1].unsqueeze(0).repeat_interleave(hparams.contextlen,dim=0)
-                    )
-            )
-            padded_feats = padded_feats.unsqueeze(0).to(device)
-            normalized = modules.normalize(padded_feats, lengths=torch.tensor([1.]))
-            encoded_all = modules.encoder(normalized)
-            front_index = hparams.front_index
-            back_index = front_index + feats.shape[0] // hparams.subsampling
-            print(uttid)
-            print("feat shape:", feats.shape)
-            print("front index:", front_index)
-            print("back index:", back_index)
-            print()
-            encoded_relevant = encoded_all[:,front_index:back_index,:]
-            out = modules.lin_out(encoded_relevant)
-            predictions = hparams.log_softmax(out)
-            kaldi_io.write_mat(fo, predictions.squeeze(0).cpu().detach().numpy(), key=uttid)
-    
+def count_scp_lines(scpfile):
+    lines = 0
+    with open(scpfile) as fin:
+        for _ in fin:
+            lines += 1
+    return lines
 
+def run_test(modules, hparams, device):
+    prior = torch.load(hparams.prior_file).to(device)
+    num_utts = count_scp_lines(hparams.test_feats)
+    with open(hparams.test_probs_out, 'wb') as fo:
+        with torch.no_grad():
+            for uttid, feats in tqdm.tqdm(kaldi_io.read_mat_scp(hparams.test_feats), total=num_utts):
+                feats = torch.from_numpy(feats)
+                padded_feats = torch.cat(
+                        (
+                            feats[0].unsqueeze(0).repeat_interleave(hparams.contextlen,dim=0),
+                            feats,
+                            feats[-1].unsqueeze(0).repeat_interleave(hparams.contextlen,dim=0)
+                        )
+                )
+                padded_feats = padded_feats.unsqueeze(0).to(device)
+                normalized = modules.normalize(padded_feats, lengths=torch.tensor([1.]))
+                encoded_all = modules.encoder(normalized)
+                front_index = hparams.front_index
+                back_index = front_index + feats.shape[0] // hparams.subsampling
+                encoded_relevant = encoded_all[:,front_index:back_index,:]
+                out = modules.lin_out(encoded_relevant)
+                predictions = hparams.log_softmax(out)
+                normalized_predictions = predictions - prior
+                kaldi_io.write_mat(fo, normalized_predictions.squeeze(0).cpu().numpy(), key=uttid)
     
 
 if __name__ == "__main__":

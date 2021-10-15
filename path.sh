@@ -1,0 +1,1 @@
+kaldi-s5/path.sh
