@@ -81,3 +81,6 @@ class Batch:
     @property
     def batchsize(self):
         return self.__length
+
+
+

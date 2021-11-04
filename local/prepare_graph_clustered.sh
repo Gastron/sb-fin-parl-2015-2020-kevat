@@ -71,6 +71,7 @@ if [ $stage -le 2 ]; then
   done
 fi
 
+
 if [ $stage -le 3 ]; then
   echo "Making HCLG full graph..."
   utils/lang/check_phones_compatible.sh \
