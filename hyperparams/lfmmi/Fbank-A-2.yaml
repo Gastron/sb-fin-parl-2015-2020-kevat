@@ -10,15 +10,16 @@
 seed: 2602
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
-trainshards: ./feat-shards/train/shard-0000{00..69}.tar
-validshards: ./feat-shards/valid/shard-000000.tar
+trainshards: ./train-shards-wav-ali/shard-000{000..137}.tar
+num_utts_train: 1109736 
+validshards: ./dev-shards-wav-ali/shard-00000{0..1}.tar
 # data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
 num_units: 2328
-output_folder: !ref exp/lfmmi-am/CRDNN-C/<seed>-<num_units>units
+output_folder: !ref exp/lfmmi-am/CRDNN-Fbank-A-2/<seed>-<num_units>units
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
-pretrain_from: exp/xent-am/CRDNN-B/2602-2328units
+pretrain_from: exp/xent-am/CRDNN-D/2602-2328units
 pretrain_max_key: accuracy
 
 numfstdir: exp/chain/graph/train
@@ -36,7 +37,7 @@ chain_loss: !new:pychain.loss.ChainLoss
 
 # Test files:
 test_min_key: "loss"
-test_wavscp: kaldi-s5/data/parl-dev-all-fixed_hires/feats.scp
+test_wavscp: kaldi-s5/data/parl-dev-all-fixed_hires/wav.scp
 test_probs_out: !ref <output_folder>/test_probs.ark
 
 # The train logger writes training statistics to a file, as well as stdout.
@@ -59,23 +60,26 @@ train_loader_kwargs:
     num_workers: 0
     looped_nominal_epoch: 2000
 dynamic_batch_kwargs:
-    len_key: "feats"
+    len_key: "wav"
     sampler_kwargs:
-        target_batch_numel: 12000 # 
-        max_batch_numel: 14000 
+        target_batch_numel: 1440000 
+        max_batch_numel: 1920000 
+    max_sample_len: 400000
 valid_dynamic_batch_kwargs:
-    len_key: "feats"
+    len_key: "wav"
     sampler_kwargs:
-        target_batch_numel: 8000 # 
-        max_batch_numel: 10000 
+        target_batch_numel: 1440000 
+        max_batch_numel: 1920000 
+    max_sample_len: 400000
 
 ckpt_interval_minutes: -1 # save checkpoint every N min
 label_smoothing: 0.0
-lr: 0.00001
+lr: 0.0001
 
-# Shape parameters
+# Feature parameters
+sample_rate: 16000
+n_fft: 400
 n_mels: 80
-contextlen: 40
 subsampling: 3
 
 # Model parameters
@@ -108,9 +112,16 @@ unk_index: 0
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
 
+# Feature extraction
+compute_features: !new:speechbrain.lobes.features.Fbank
+    sample_rate: !ref <sample_rate>
+    n_fft: !ref <n_fft>
+    n_mels: !ref <n_mels>
+
 # Feature normalization (mean and std)
 normalize: !new:speechbrain.processing.features.InputNormalization
     norm_type: global
+    update_until_epoch: -1
 
 # The CRDNN model is an encoder that combines CNNs, RNNs, and DNNs.
 encoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
@@ -152,7 +163,7 @@ modules:
     normalize: !ref <normalize>
 
 lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
-    initial_value: 3.0
+    initial_value: !ref <lr>
     annealing_factor: 0.9
 
 opt_class: !name:torch.optim.Adam

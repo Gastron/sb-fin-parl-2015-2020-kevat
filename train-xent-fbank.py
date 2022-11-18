@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 class XentAM(sb.Brain):
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
+        feats = (self.hparams.compute_features(batch.wav.data)).detach()
         epoch = self.hparams.epoch_counter.current
-        normalized = self.modules.normalize(batch.feats.data, lengths=batch.feats.lengths, epoch=epoch)
+        normalized = self.modules.normalize(feats, lengths=batch.wav.lengths, epoch=epoch)
         encoded = self.modules.encoder(normalized)
         out = self.modules.lin_out(encoded)
         predictions = self.hparams.log_softmax(out)
@@ -111,7 +112,7 @@ class XentAM(sb.Brain):
             for batch in tqdm.tqdm(dataloader):
                 log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
                 predictions = log_predictions.exp()
-                lengths = batch.feats.lengths*predictions.shape[1]
+                lengths = batch.wav.lengths*predictions.shape[1]
                 mask = sb.dataio.dataio.length_to_mask(lengths).float()
                 summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
                 prior += summed_preds.detach().cpu()
@@ -162,7 +163,7 @@ def dataio_prepare(hparams):
     traindata = (
             wds.WebDataset(hparams["trainshards"])
             .decode()
-            .rename(feats="feats.pth", ali="ali.pth")
+            .rename(wav="audio.pth", ali="ali.pth")
             .repeat()
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -172,7 +173,7 @@ def dataio_prepare(hparams):
     validdata = (
             wds.WebDataset(hparams["validshards"])
             .decode()
-            .rename(feats="feats.pth", ali="ali.pth")
+            .rename(wav="audio.pth", ali="ali.pth")
             .batched(hparams["valid_batchsize"], collation_fn=sb.dataio.batch.PaddedBatch)
     )
     return {"train": traindata, "valid": validdata}

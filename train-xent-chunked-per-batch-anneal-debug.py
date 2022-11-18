@@ -24,22 +24,29 @@ class XentAM(sb.Brain):
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
         epoch = self.hparams.epoch_counter.current
-        normalized = self.modules.normalize(batch.feats.data, lengths=batch.feats.lengths, epoch=epoch)
-        encoded = self.modules.encoder(normalized)
-        out = self.modules.lin_out(encoded)
+        normalized = self.modules.normalize(batch.feats, lengths=torch.ones(batch.feats.shape[0]), epoch=epoch)
+        #logger.info(normalized[0,0,:])
+        encoded_all = self.modules.encoder(normalized)
+        #logger.info(encoded_all[0,0,:])
+        # Batches have some context in them (to help), 
+        # but this should not be predicted:
+        encoded_relevant = encoded_all[:,self.hparams.front_index:self.hparams.back_index,:]
+        #logger.info(encoded_relevant[0,0,:])
+        out = self.modules.lin_out(encoded_relevant)
+        #logger.info(out[0,0,:])
         predictions = self.hparams.log_softmax(out)
+        if self.step % 100 == 0:
+            logger.info(torch.argmax(predictions, dim=2))
         return predictions
 
     def compute_objectives(self, predictions, batch, stage):
         loss = sb.nnet.losses.nll_loss(
             log_probabilities=predictions,
-            length=batch.ali.lengths,
-            targets=batch.ali.data,
+            targets=batch["ali"],
             label_smoothing=self.hparams.label_smoothing,
         )
         if stage != sb.Stage.TRAIN:
-            min_length = min(predictions.shape[1], batch.ali.data.shape[1])
-            self.accuracy_metric.append(predictions[:,:min_length,:], batch.ali.data[:,:min_length], length=batch.ali.lengths)
+            self.accuracy_metric.append(predictions, batch["ali"])
         return loss
 
     def on_stage_start(self, stage, epoch):
@@ -61,21 +68,11 @@ class XentAM(sb.Brain):
         # Perform end-of-iteration things, like annealing, logging, etc.
         if stage == sb.Stage.VALID:
 
-            # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["loss"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
-            )
-
-            # Save the current checkpoint and delete previous checkpoints.
-            self.checkpointer.save_and_keep_only(
-                meta={"accuracy": stage_stats["accuracy"]}, max_keys=["accuracy"],
-                num_to_keep=getattr(self.hparams, "ckpts_to_keep", 1)
             )
 
         # We also write statistics about test data to stdout and to the logfile.
@@ -84,6 +81,26 @@ class XentAM(sb.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
+
+
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        predictions = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(predictions, batch, sb.Stage.TRAIN)
+
+        # normalize the loss by gradient_accumulation step
+        (loss / self.hparams.gradient_accumulation).backward()
+
+        if self.step % self.hparams.gradient_accumulation == 0:
+            # gradient clipping & early stop if loss is not fini
+            if self.check_gradients(loss):
+                self.optimizer.step()
+                old_lr, new_lr = self.hparams.lr_annealing(self.optimizer)
+                if self.step % 200 == 0:
+                    logger.info(f"NEW LR {new_lr}")
+            self.optimizer.zero_grad()
+        return loss.detach().cpu()
+
 
     def on_evaluate_start(self, max_key=None, min_key=None):
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
@@ -99,47 +116,21 @@ class XentAM(sb.Brain):
             self.hparams.model.load_state_dict(model_state_dict)
             self.checkpointer.save_checkpoint(name=f"AVERAGED-{self.hparams.avg_ckpts}")
 
-    def estimate_prior_empirical(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
+    def estimate_prior(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
         self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.hparams.train_logger.log_stats(
-            stats_meta={"Epoch loaded for prior": self.hparams.epoch_counter.current},
-        )
         dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
         with torch.no_grad():
-            prior_floor = 1.0e-15
-            prior = torch.ones((self.hparams.num_units,)) * prior_floor
+            prior = torch.zeros((self.hparams.num_units,))
+            num_predictions = 0
             for batch in tqdm.tqdm(dataloader):
-                log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
-                predictions = log_predictions.exp()
-                lengths = batch.feats.lengths*predictions.shape[1]
-                mask = sb.dataio.dataio.length_to_mask(lengths).float()
-                summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
+                predictions = self.compute_forward(batch, stage=sb.Stage.TEST) 
+                summed_preds = torch.sum(predictions, dim=(0,1))
                 prior += summed_preds.detach().cpu()
-            # Normalize:
-            prior = prior / prior.sum()
-        return prior.log()
+                num_predictions += predictions.shape[0]*predictions.shape[1]
+            prior = prior / num_predictions
+        return prior
 
-    def estimate_prior_frequency(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
-        self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.hparams.train_logger.log_stats(
-            stats_meta={"Epoch loaded for prior": self.hparams.epoch_counter.current},
-        )
-        dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
-        with torch.no_grad():
-            num_classes = self.hparams.num_units
-            total_occurences = torch.zeros((num_classes,))
-            for batch in tqdm.tqdm(dataloader):
-                occurences = torch.nn.functional.one_hot(batch.ali.data.long(), num_classes = num_classes)
-                lengths = batch.ali.lengths*occurences.shape[1]
-                mask = sb.dataio.dataio.length_to_mask(lengths)
-                total_occurences += torch.sum(occurences * mask.unsqueeze(-1), dim=(0,1))
-            if any(count == 0 for count in total_occurences):
-                logger.warn("Zero count detected, using EPS")
-                EPS = 1e-5
-                log_prior = ((total_occurences+EPS) / total_occurences.sum()).log()
-            else:
-                log_prior = (total_occurences / total_occurences.sum()).log()
-            return log_prior
+            
 
 
 def dataio_prepare(hparams):
@@ -164,20 +155,15 @@ def dataio_prepare(hparams):
             .decode()
             .rename(feats="feats.pth", ali="ali.pth")
             .repeat()
-            .then(
-                sb.dataio.iterators.dynamic_bucketed_batch,
-                **hparams["dynamic_batch_kwargs"]
-            )
+            .batched(hparams["train_batchsize"], collation_fn=local.Batch)
     )
     validdata = (
             wds.WebDataset(hparams["validshards"])
             .decode()
             .rename(feats="feats.pth", ali="ali.pth")
-            .batched(hparams["valid_batchsize"], collation_fn=sb.dataio.batch.PaddedBatch)
+            .batched(hparams["valid_batchsize"], collation_fn=local.Batch)
     )
     return {"train": traindata, "valid": validdata}
-
-
 
 
 
@@ -200,10 +186,15 @@ if __name__ == "__main__":
 
     # We can now directly create the datasets for training, valid, and test
     datasets = dataio_prepare(hparams)
+    datasets["train"] = [next(iter(datasets["train"]))]
+    train_loader_kwargs = hparams["train_loader_kwargs"]
+    train_loader_kwargs["batch_size"] = None
+    train_loader_kwargs["looped_nominal_epoch"] = 300
+    train_loader_kwargs["num_workers"] = 0 
 
     # Pretrain if defined:
     if "pretrainer" in hparams:
-        ckpt = hparams["ckpt_finder"].find_checkpoint(max_key="accuracy")
+        ckpt = hparams["ckpt_finder"].find_checkpoint(min_key="WER")
         hparams["pretrainer"].collect_files(ckpt.path)
         hparams["pretrainer"].load_collected()
 
@@ -223,12 +214,7 @@ if __name__ == "__main__":
     asr_brain.fit(
         asr_brain.hparams.epoch_counter,
         datasets["train"],
-        datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+        datasets["train"],
+        train_loader_kwargs = train_loader_kwargs,
+        valid_loader_kwargs = {"batch_size":None}
     )
-    prior = asr_brain.estimate_prior_empirical(
-            datasets["train"], 
-            loader_kwargs=hparams["prior_loader_kwargs"],
-            max_key=hparams["test_max_key"]
-    )
-    torch.save(prior, hparams["prior_file"])

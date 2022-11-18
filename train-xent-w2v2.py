@@ -15,6 +15,9 @@ import io
 import torchaudio
 import local
 import tqdm
+from pychain import ChainGraph, ChainGraphBatch 
+import simplefst
+import pathlib
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +26,12 @@ logger = logging.getLogger(__name__)
 class XentAM(sb.Brain):
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
-        epoch = self.hparams.epoch_counter.current
-        normalized = self.modules.normalize(batch.feats.data, lengths=batch.feats.lengths, epoch=epoch)
-        encoded = self.modules.encoder(normalized)
-        out = self.modules.lin_out(encoded)
-        predictions = self.hparams.log_softmax(out)
-        return predictions
+        feats = self.modules.wav2vec2(batch.wav.data)
+        downsampled = feats[:,::2,:]
+        encoded = self.modules.enc(downsampled)
+        xent_out = self.modules.xent_lin_out(encoded)
+        xent_predictions = self.hparams.log_softmax(xent_out)
+        return xent_predictions
 
     def compute_objectives(self, predictions, batch, stage):
         loss = sb.nnet.losses.nll_loss(
@@ -47,34 +50,43 @@ class XentAM(sb.Brain):
             self.accuracy_metric = self.hparams.accuracy_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
-
-        # Store the train loss until the validation stage.
         stage_stats = {"loss": stage_loss}
+        # Store the train loss until the validation stage.
         if stage == sb.Stage.TRAIN:
             self.train_stats = stage_stats
         # Summarize the statistics from the stage for record-keeping.
         else:
             stage_stats["accuracy"] = self.accuracy_metric.summarize()
 
-        old_lr = self.hparams.lr_annealing.current_lr
-
         # Perform end-of-iteration things, like annealing, logging, etc.
         if stage == sb.Stage.VALID:
-
-            # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["loss"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-
-            # The train_logger writes a summary to stdout and to the logfile.
+            old_lr_model, new_lr_model = self.hparams.lr_annealing_model(
+                stage_stats["loss"]
+            )
+            old_lr_wav2vec, new_lr_wav2vec = self.hparams.lr_annealing_wav2vec(
+                stage_stats["loss"]
+            )
+            sb.nnet.schedulers.update_learning_rate(
+                self.model_optimizer, new_lr_model
+            )
+            if not self.hparams.wav2vec2.freeze:
+                sb.nnet.schedulers.update_learning_rate(
+                    self.wav2vec_optimizer, new_lr_wav2vec
+                )
             self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": old_lr},
+                stats_meta={
+                    "epoch": epoch,
+                    "lr_model": old_lr_model,
+                    "lr_wav2vec": old_lr_wav2vec,
+                },
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
             )
 
             # Save the current checkpoint and delete previous checkpoints.
             self.checkpointer.save_and_keep_only(
-                meta={"accuracy": stage_stats["accuracy"]}, max_keys=["accuracy"],
+                meta={"loss": stage_stats["loss"], "xent-accuracy": stage_stats["accuracy"]}, 
+                min_keys=["loss"],
                 num_to_keep=getattr(self.hparams, "ckpts_to_keep", 1)
             )
 
@@ -84,6 +96,44 @@ class XentAM(sb.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
+
+    def init_optimizers(self):
+        "Initializes the wav2vec2 optimizer and model optimizer"
+        if not self.hparams.wav2vec2.freeze:
+            self.wav2vec_optimizer = self.hparams.wav2vec_opt_class(
+                self.modules.wav2vec2.parameters()
+            )
+            if self.checkpointer is not None:
+                self.checkpointer.add_recoverable(
+                    "wav2vec_opt", self.wav2vec_optimizer
+                )
+        self.model_optimizer = self.hparams.model_opt_class(
+            self.hparams.model.parameters()
+        )
+
+        if self.checkpointer is not None:
+            self.checkpointer.add_recoverable("modelopt", self.model_optimizer)
+
+    
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        should_step = self.step % self.hparams.grad_accumulation_factor == 0
+        outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+        (loss / self.hparams.grad_accumulation_factor).backward()
+
+        if should_step:
+            if self.check_gradients(loss):
+                if not self.hparams.wav2vec2.freeze:
+                    self.wav2vec_optimizer.step()
+                self.model_optimizer.step()
+        
+            if not self.hparams.wav2vec2.freeze:
+                self.wav2vec_optimizer.zero_grad()
+            self.model_optimizer.zero_grad()
+
+        return loss.detach()
+
 
     def on_evaluate_start(self, max_key=None, min_key=None):
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
@@ -111,35 +161,13 @@ class XentAM(sb.Brain):
             for batch in tqdm.tqdm(dataloader):
                 log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
                 predictions = log_predictions.exp()
-                lengths = batch.feats.lengths*predictions.shape[1]
+                lengths = batch.wav.lengths*predictions.shape[1]
                 mask = sb.dataio.dataio.length_to_mask(lengths).float()
                 summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
                 prior += summed_preds.detach().cpu()
             # Normalize:
             prior = prior / prior.sum()
         return prior.log()
-
-    def estimate_prior_frequency(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
-        self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.hparams.train_logger.log_stats(
-            stats_meta={"Epoch loaded for prior": self.hparams.epoch_counter.current},
-        )
-        dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
-        with torch.no_grad():
-            num_classes = self.hparams.num_units
-            total_occurences = torch.zeros((num_classes,))
-            for batch in tqdm.tqdm(dataloader):
-                occurences = torch.nn.functional.one_hot(batch.ali.data.long(), num_classes = num_classes)
-                lengths = batch.ali.lengths*occurences.shape[1]
-                mask = sb.dataio.dataio.length_to_mask(lengths)
-                total_occurences += torch.sum(occurences * mask.unsqueeze(-1), dim=(0,1))
-            if any(count == 0 for count in total_occurences):
-                logger.warn("Zero count detected, using EPS")
-                EPS = 1e-5
-                log_prior = ((total_occurences+EPS) / total_occurences.sum()).log()
-            else:
-                log_prior = (total_occurences / total_occurences.sum()).log()
-            return log_prior
 
 
 def dataio_prepare(hparams):
@@ -162,7 +190,7 @@ def dataio_prepare(hparams):
     traindata = (
             wds.WebDataset(hparams["trainshards"])
             .decode()
-            .rename(feats="feats.pth", ali="ali.pth")
+            .rename(wav="audio.pth", ali="ali.pth")
             .repeat()
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -172,15 +200,14 @@ def dataio_prepare(hparams):
     validdata = (
             wds.WebDataset(hparams["validshards"])
             .decode()
-            .rename(feats="feats.pth", ali="ali.pth")
-            .batched(hparams["valid_batchsize"], collation_fn=sb.dataio.batch.PaddedBatch)
+            .rename(wav="audio.pth", ali="ali.pth")
+            .then(
+                sb.dataio.iterators.dynamic_bucketed_batch,
+                **hparams["valid_dynamic_batch_kwargs"],
+                drop_end=False
+            )
     )
     return {"train": traindata, "valid": validdata}
-
-
-
-
-
 
 if __name__ == "__main__":
 
@@ -210,7 +237,6 @@ if __name__ == "__main__":
     # Trainer initialization
     asr_brain = XentAM(
         modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],

@@ -4,6 +4,7 @@ from speechbrain.dataio.batch import (default_convert, mod_default_collate, recu
 class NoSchedule:
     def __init__(self, lr, **kwargs):
         self.lr = lr
+        self.current_lr = lr
 
     def __call__(self, *args, **kwargs):
         return self.lr, self.lr
@@ -83,4 +84,13 @@ class Batch:
         return self.__length
 
 
+class Stacker(torch.nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
 
+    def forward(self, x):
+        old_shape = x.shape
+        new_shape = (old_shape[0], old_shape[1] // self.n, old_shape[2]*self.n)
+        time_clamp = old_shape[1] - (old_shape[1] % self.n)
+        return x[:,:time_clamp,:].reshape(new_shape)

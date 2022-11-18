@@ -15,6 +15,8 @@ import io
 import torchaudio
 import local
 import tqdm
+from ptpython.repl import embed
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,11 @@ logger = logging.getLogger(__name__)
 class XentAM(sb.Brain):
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
+        feats = (self.hparams.compute_features(batch.wav.data)).detach()
+        print(feats.shape[1], batch.ali.data.shape[1])
         epoch = self.hparams.epoch_counter.current
-        normalized = self.modules.normalize(batch.feats.data, lengths=batch.feats.lengths, epoch=epoch)
-        encoded = self.modules.encoder(normalized)
+        normalized = self.modules.normalize(feats, lengths=batch.wav.lengths, epoch=epoch)
+        encoded = self.modules.encoder(normalized, lengths=batch.wav.lengths)
         out = self.modules.lin_out(encoded)
         predictions = self.hparams.log_softmax(out)
         return predictions
@@ -61,10 +65,6 @@ class XentAM(sb.Brain):
         # Perform end-of-iteration things, like annealing, logging, etc.
         if stage == sb.Stage.VALID:
 
-            # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["loss"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
@@ -84,6 +84,24 @@ class XentAM(sb.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
+
+
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        predictions = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(predictions, batch, sb.Stage.TRAIN)
+
+        # normalize the loss by gradient_accumulation step
+        (loss / self.hparams.gradient_accumulation).backward()
+
+        if self.step % self.hparams.gradient_accumulation == 0:
+            # gradient clipping & early stop if loss is not fini
+            if self.check_gradients(loss):
+                old_lr, new_lr = self.hparams.lr_annealing(self.optimizer)
+                self.optimizer.step()
+            self.optimizer.zero_grad()
+        return loss.detach().cpu()
+
 
     def on_evaluate_start(self, max_key=None, min_key=None):
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
@@ -111,7 +129,7 @@ class XentAM(sb.Brain):
             for batch in tqdm.tqdm(dataloader):
                 log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
                 predictions = log_predictions.exp()
-                lengths = batch.feats.lengths*predictions.shape[1]
+                lengths = batch.wav.lengths*predictions.shape[1]
                 mask = sb.dataio.dataio.length_to_mask(lengths).float()
                 summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
                 prior += summed_preds.detach().cpu()
@@ -140,6 +158,8 @@ class XentAM(sb.Brain):
             else:
                 log_prior = (total_occurences / total_occurences.sum()).log()
             return log_prior
+
+            
 
 
 def dataio_prepare(hparams):
@@ -176,8 +196,6 @@ def dataio_prepare(hparams):
             .batched(hparams["valid_batchsize"], collation_fn=sb.dataio.batch.PaddedBatch)
     )
     return {"train": traindata, "valid": validdata}
-
-
 
 
 

@@ -1,0 +1,24 @@
+# A set of hyperparameters for development
+
+# Paths, meta, etc.
+expdir: exp/develop-xent/1
+sharddir: xent-shards/
+#trainset: train
+validset: parl-dev-all-fixed
+
+# Data
+valid_shards: !apply:glob.glob
+  - !ref <sharddir>/<validset>/*.tar
+
+train_loader_kwargs:
+  looped_nominal_epoch: 100
+
+# Models
+feat_maker: !new:speechbrain.lobes.features.Fbank
+  n_mels: 80
+  f_min: 20
+  f_max: 7600
+
+opt_class: null 
+
+modules: null

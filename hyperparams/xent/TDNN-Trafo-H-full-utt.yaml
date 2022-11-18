@@ -10,14 +10,15 @@
 seed: 2602
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
-trainshards: ./train-shards-xent-chunks/shard-000{000..574}.tar
-validshards: ./dev-all-shards-xent-chunks-fixed//shard-00000{0..3}.tar
+trainshards: ./train-shards-feat-ali/shard-0000{00..69}.tar
+validshards: ./dev-shards-feat-ali/shard-00000{0..1}.tar
 # data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
 num_units: 2328
-output_folder: !ref exp/xent-am/TDNN-A/<seed>-<num_units>units
+output_folder: !ref exp/xent-am/TDNN-Trafo-H-full-utt/<seed>-<num_units>units
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
+gradient_accumulation: 1
 
 # Test files:
 prior_file: !ref <output_folder>/prior.pth
@@ -30,7 +31,7 @@ train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
 # Training parameters
-number_of_epochs: 72
+number_of_epochs: 60
 
 train_loader_kwargs:
     num_workers: 4
@@ -38,21 +39,25 @@ train_loader_kwargs:
 prior_loader_kwargs:
     num_workers: 4
     looped_nominal_epoch: 1000
-train_batchsize: 64
-valid_batchsize: 64
+
+dynamic_batch_kwargs:
+    len_key: "feats"
+    sampler_kwargs:
+        target_batch_numel: 9000 # 
+        max_batch_numel: 12000 
+    max_sample_len: 2500
+valid_batchsize: 12
+
 ckpt_interval_minutes: -1 # save checkpoint every N min
 label_smoothing: 0.0
-lr: 0.0001
+lr: 1.0
 
 # Shape parameters
 n_mels: 80
-chunklen: 140
-contextlen: 40
 subsampling: 3
-front_index: !apply:math.ceil
-  - !ref <contextlen> / <subsampling>
-back_index: !apply:math.floor
-  - !ref <contextlen> / <subsampling> + <chunklen> / <subsampling> 
+
+# Common Model params
+d_model: 384
 
 # The first object passed to the Brain class is this "Epoch Counter"
 # which is saved by the Checkpointer so that training can be resumed
@@ -65,19 +70,37 @@ normalize: !new:speechbrain.processing.features.InputNormalization
     norm_type: global
 
 # The CRDNN model is an encoder that combines CNNs, RNNs, and DNNs.
-encoder: !new:tdnn.TDNN
+tdnn: !new:tdnn.TDNN
   in_dim: !ref <n_mels>
-  num_layers: 7
-  hidden_dims: ( 768, 768, 768, 768, 768, 768, 768 )
-  kernel_sizes: ( 3, 3, 3, 3, 3, 3, 3 )
-  strides: ( 1, 1, 1, 1, 1, 1, 3 )
-  dilations: ( 1, 1, 3, 3, 3, 3, 3 )
+  num_layers: 5
+  hidden_dims: [ !ref <d_model>, !ref <d_model>, !ref <d_model>, !ref <d_model>, !ref <d_model> ]
+  kernel_sizes: ( 3, 3, 3, 3, 3 )
+  strides: ( 1, 1, 1, 1, 3 )
+  dilations: ( 1, 1, 3, 3, 3, )
   dropout: 0.2
   residual: false
 
+transformer: !new:trafo.TransformerAM
+  input_size: !ref <d_model>
+  d_model: !ref <d_model>
+  nhead: 8
+  num_encoder_layers: 6
+  dropout: 0.2
+  activation: !name:torch.nn.GELU
+  d_ffn: 1024
+  normalize_before: True
+  positional_encoding: "fixed_abs_sine"
+
+encoder: !new:speechbrain.nnet.containers.LengthsCapableSequential
+  - !ref <tdnn>
+  - !new:speechbrain.nnet.normalization.BatchNorm1d
+    input_size: !ref <d_model>
+    combine_batch_time: True
+  - !ref <transformer>
+
 # Linear transformation on the top of the decoder.
 lin_out: !new:speechbrain.nnet.linear.Linear
-    input_size: 768
+    input_size: !ref <d_model>
     n_neurons: !ref <num_units>
 
 # Final softmax (for log posteriors computation).
@@ -91,8 +114,11 @@ modules:
     lin_out: !ref <lin_out>
     normalize: !ref <normalize>
 
-lr_annealing: !new:local.NoSchedule
-    lr: !ref <lr>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
+    lr_initial: !ref <lr>
+    n_warmup_steps: 5000
+    model_size: !ref <d_model>
 
 opt_class: !name:torch.optim.Adam
       lr: !ref <lr> 
@@ -109,4 +135,5 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
         encoder: !ref <encoder>
         lin_out: !ref <lin_out>
         normalizer: !ref <normalize>
+        scheduler: !ref <lr_annealing>
         counter: !ref <epoch_counter>

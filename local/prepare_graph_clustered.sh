@@ -7,7 +7,6 @@
 set -e -o pipefail
 
 dataroot=kaldi-s5/data
-dataroot=kaldi-s5/data
 train_set=train
 valid_set=parl-dev-all-fixed
 alipath=kaldi-s5/exp/i/tri4j_ali
