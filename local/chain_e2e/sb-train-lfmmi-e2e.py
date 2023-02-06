@@ -37,9 +37,7 @@ class LFMMIAM(sb.Brain):
         normalized = self.modules.normalize(feats, lengths=batch.wav.lengths)
         encoded = self.modules.encoder(normalized)
         lfmmi_out = self.modules.lfmmi_lin_out(encoded)
-        xent_out = self.modules.xent_lin_out(encoded)
-        xent_predictions = self.hparams.log_softmax(xent_out)
-        return lfmmi_out, xent_predictions
+        return lfmmi_out
 
     def load_graph(self, uttid):
         try:
@@ -49,7 +47,7 @@ class LFMMIAM(sb.Brain):
             return None
 
     def compute_objectives(self, predictions, batch, stage):
-        lfmmi_out, xent_predictions = predictions
+        lfmmi_out = predictions
         # Get the grahps:
         if stage == sb.Stage.TRAIN:
             futures = []
@@ -72,32 +70,16 @@ class LFMMIAM(sb.Brain):
                 max_num_states=max_num_states
         )
         lfmmi_loss = self.hparams.chain_loss(lfmmi_out, output_lengths, numerator_graphs)
-        xent_loss = sb.nnet.losses.nll_loss(
-            log_probabilities=xent_predictions,
-            length=batch.ali.lengths,
-            targets=batch.ali.data,
-            label_smoothing=self.hparams.label_smoothing,
-        )
         output_norm_loss = torch.linalg.norm(lfmmi_out,dim=2).mean()
 
-        loss = lfmmi_loss + self.hparams.xent_scale * xent_loss + output_norm_loss*self.hparams.outnorm_scale
-        if stage != sb.Stage.TRAIN:
-            min_length = min(xent_predictions.shape[1], batch.ali.data.shape[1])
-            self.accuracy_metric.append(xent_predictions[:,:min_length,:], batch.ali.data[:,:min_length], length=batch.ali.lengths)
+        loss = lfmmi_loss + output_norm_loss*self.hparams.outnorm_scale
         return loss
-
-    def on_stage_start(self, stage, epoch):
-        if stage != sb.Stage.TRAIN:
-            self.accuracy_metric = self.hparams.accuracy_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
         stage_stats = {"loss": stage_loss}
         # Store the train loss until the validation stage.
         if stage == sb.Stage.TRAIN:
             self.train_stats = stage_stats
-        # Summarize the statistics from the stage for record-keeping.
-        else:
-            stage_stats["accuracy"] = self.accuracy_metric.summarize()
 
         # Perform end-of-iteration things, like annealing, logging, etc.
         if stage == sb.Stage.VALID:
@@ -115,7 +97,7 @@ class LFMMIAM(sb.Brain):
 
             # Save the current checkpoint and delete previous checkpoints.
             self.checkpointer.save_and_keep_only(
-                meta={"loss": stage_stats["loss"], "xent-accuracy": stage_stats["accuracy"]}, 
+                meta={"loss": stage_stats["loss"]}, 
                 min_keys=["loss"],
                 num_to_keep=getattr(self.hparams, "ckpts_to_keep", 1)
             )
@@ -140,26 +122,6 @@ class LFMMIAM(sb.Brain):
             )
             self.hparams.model.load_state_dict(model_state_dict)
             self.checkpointer.save_checkpoint(name=f"AVERAGED-{self.hparams.avg_ckpts}")
-
-    def estimate_prior_empirical(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
-        self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.hparams.train_logger.log_stats(
-            stats_meta={"Epoch loaded for prior": self.hparams.epoch_counter.current},
-        )
-        dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
-        with torch.no_grad():
-            prior_floor = 1.0e-15
-            prior = torch.ones((self.hparams.num_units,)) * prior_floor
-            for batch in tqdm.tqdm(dataloader):
-                lfmmi_pred, log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
-                predictions = log_predictions.exp()
-                lengths = batch.wav.lengths*predictions.shape[1]
-                mask = sb.dataio.dataio.length_to_mask(lengths).float()
-                summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
-                prior += summed_preds.detach().cpu()
-            # Normalize:
-            prior = prior / prior.sum()
-        return prior.log()
 
 def numfsts_to_local_tmp(fstdir, tmpdir):
     """Copies the chain numerator FSTs onto a local disk"""
@@ -206,7 +168,7 @@ def dataio_prepare(hparams, numfsts):
     traindata = (
             wds.WebDataset(hparams["trainshards"])
             .decode()
-            .rename(wav="audio.pth", ali="ali.pth")
+            .rename(wav="audio.pth")
             .repeat()
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -216,7 +178,7 @@ def dataio_prepare(hparams, numfsts):
     validdata = (
             wds.WebDataset(hparams["validshards"])
             .decode()
-            .rename(wav="audio.pth", ali="ali.pth")
+            .rename(wav="audio.pth")
             .map(load_valid_fst, handler=wds.warn_and_continue)
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -230,6 +192,9 @@ def dataio_prepare(hparams, numfsts):
 
 
 if __name__ == "__main__":
+    import os
+    print("SLURM_STEP_GPUS", os.environ.get("SLURM_STEP_GPUS"))
+    print("SLURM_JOB_GPUS", os.environ.get("SLURM_JOB_GPUS"))
 
     # Reading command line arguments
     hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
@@ -289,22 +254,13 @@ if __name__ == "__main__":
     # necessary to update the parameters of the model. Since all objects
     # with changing state are managed by the Checkpointer, training can be
     # stopped at any point, and will be resumed on next call.
+    valid_loader_kwargs = hparams.get("valid_loader_kwargs", {})
+    if "batch_size" not in valid_loader_kwargs:
+        valid_loader_kwargs["batch_size"] = None
     asr_brain.fit(
         asr_brain.hparams.epoch_counter,
         datasets["train"],
         datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+        train_loader_kwargs = hparams["train_loader_kwargs"],
+        valid_loader_kwargs = valid_loader_kwargs 
     )
-    
-    if "prior_file" in hparams:
-        kwargs = {}
-        if "test_max_key" in hparams:
-            kwargs["max_key"] = hparams["test_max_key"]
-        elif "test_min_key" in hparams:
-            kwargs["min_key"] = hparams["test_min_key"]
-        prior = asr_brain.estimate_prior_empirical(
-                datasets["train"], 
-                loader_kwargs=hparams["prior_loader_kwargs"],
-                **kwargs
-        )
-        torch.save(prior, hparams["prior_file"])

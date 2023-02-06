@@ -5,6 +5,7 @@ module load variKN
 module load sentencepiece
 source speechbrain/speechbrain-env/bin/activate
 export PYTHONPATH=$PYTHONPATH:pychain/
+export PYTHONPATH=$PYTHONPATH:./
 
 export PATH=$PWD/utils:$PATH
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$PWD:pychain/openfst-1.7.5/lib/

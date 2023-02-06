@@ -6,15 +6,14 @@
 
 set -e -o pipefail
 
-dataroot=kaldi-s5/data
-train_set=train
-valid_set=parl-dev-all-fixed
-alipath="kaldi-s5/exp/i/tri4j_ali"
+dataroot=data
+trainset=uit-sme-segmented
+validset=giellagas-valid
 
-tree_dir=kaldi-s5/exp/chain/tree
-lang=kaldi-s5/data/lang_chain
-test_lang=kaldi-s5/data/lang_test_varikn.bpe1750.d0.0001/
-graph=exp/chain/graph
+treedir=exp/chain/tree2
+lang=data/lang_chain
+graph=exp/chain/graph2
+scale_opts=
 
 stage=0
 
@@ -28,8 +27,8 @@ if [ $stage -le 0 ]; then
   echo "Estimating a phone language model for the denominator graph..."
   mkdir -p $graph/log
   $train_cmd $graph/log/make_phone_lm.log \
-             cat $dataroot/$train_set/text \| \
-             local/text_to_phones.py --between-silprob 0.1 \
+             cat $dataroot/$trainset/text \| \
+             local/chain/text_to_phones.py --between-silprob 0.1 \
              $lang \| \
              utils/sym2int.pl -f 2- $lang/phones.txt \| \
              chain-est-phone-lm --num-extra-lm-states=2000 \
@@ -39,10 +38,10 @@ fi
 if [ $stage -le 1 ]; then
   echo "$0: Stage 1: Graph generation..."
   echo "Copying the relevant files"
-  cp $tree_dir/final.mdl $graph/0.mdl
-  cp $tree_dir/final.mdl $graph/final.mdl
-  copy-transition-model $tree_dir/final.mdl $graph/0.trans_mdl
-  cp $tree_dir/tree $graph/tree
+  cp $treedir/final.mdl $graph/0.mdl
+  cp $treedir/final.mdl $graph/final.mdl
+  copy-transition-model $treedir/final.mdl $graph/0.trans_mdl
+  cp $treedir/tree $graph/tree
   echo "Making denominator graph..."
   $train_cmd $graph/log/make_den_fst.log \
        chain-make-den-fst $graph/tree $graph/final.mdl \
@@ -55,8 +54,8 @@ if [ $stage -le 2 ]; then
   echo "Making numerator graph..."
   lex=$lang/L.fst
   oov_sym=`cat $lang/oov.int` || exit 1;
-  for x in $train_set $valid_set; do
-    nj=$(cat "$alipath"_$x/num_jobs)
+  nj=$(cat "$treedir"/num_jobs)
+  for x in $trainset $validset; do
     sdata=$dataroot/$x/split$nj;
     [[ -d $sdata && $dataroot/$x/feats.scp -ot $sdata ]] || split_data.sh $dataroot/$x $nj || exit 1;
     $train_cmd JOB=1:$nj $graph/$x/log/compile_graphs.JOB.log \
@@ -71,11 +70,11 @@ if [ $stage -le 2 ]; then
 fi
 
 
-if [ $stage -le 3 ]; then
-  echo "Making HCLG full graph..."
-  utils/lang/check_phones_compatible.sh \
-    $test_lang/phones.txt $lang/phones.txt
-  utils/mkgraph.sh \
-    --self-loop-scale 1.0 $test_lang \
-    $graph $graph/graph_test || exit 1;
-fi
+#if [ $stage -le 3 ]; then
+#  echo "Making HCLG full graph..."
+#  utils/lang/check_phones_compatible.sh \
+#    $test_lang/phones.txt $lang/phones.txt
+#  utils/mkgraph.sh \
+#    --self-loop-scale 1.0 $test_lang \
+#    $graph $graph/graph_test || exit 1;
+#fi

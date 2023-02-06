@@ -11,7 +11,8 @@ import kaldi_io
 import tqdm
 from types import SimpleNamespace
 sys.path.append("./local")
-from make_shards import wavscp_to_output
+from make_shards import wavscp_to_output, segments_to_output
+import pathlib
 
 def setup(hparams, run_opts):
     """ Kind of mimics what Brain does """
@@ -47,17 +48,24 @@ def count_scp_lines(scpfile):
     return lines
 
 def run_test(modules, hparams, device):
-    num_utts = count_scp_lines(hparams.test_wavscp)
+    testdir = pathlib.Path(hparams.testdir)
+    if (testdir / "segments").exists():
+        num_utts = count_scp_lines(testdir / "segments")
+        data_iter = segments_to_output(testdir / "segments", testdir / "wav.scp")
+    else:
+        num_utts = count_scp_lines(testdir / "wav.scp")
+        data_iter = wavscp_to_output(testdir / "wav.scp")
     with open(hparams.test_probs_out, 'wb') as fo:
-        data_iter = wavscp_to_output(hparams.test_wavscp)
         with torch.no_grad():
             for uttid, data in tqdm.tqdm(data_iter, total=num_utts):
                 audio = data["audio.pth"].to(device).unsqueeze(0)
                 feats = hparams.compute_features(audio)
                 normalized = modules.normalize(feats, lengths=torch.tensor([1.]), epoch=1000)
                 encoded = modules.encoder(normalized)
-                out = modules.lin_out(encoded)
-                kaldi_io.write_mat(fo, out.squeeze(0).cpu().numpy(), key=uttid)
+                lfmmi_out = modules.lfmmi_lin_out(encoded)
+                if hparams.normalize_out:
+                    lfmmi_out = hparams.log_softmax(lfmmi_out)
+                kaldi_io.write_mat(fo, lfmmi_out.squeeze(0).cpu().numpy(), key=uttid)
     
 
 if __name__ == "__main__":

@@ -15,11 +15,11 @@ num_utts_train: 1109736
 validshards: ./dev-shards-wav-ali/shard-00000{0..1}.tar
 # data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
 num_units: 2328
-output_folder: !ref exp/mtl-am/New-CRDNN-J/<seed>-<num_units>units
+output_folder: !ref exp/mtl-am/New-CRDNN-J-contd/<seed>-<num_units>units
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
-#pretrain_from: exp/xent-am/CRDNN-D/2602-2328units
+pretrain_from: !ref exp/mtl-am/New-CRDNN-J/<seed>-<num_units>units
 
 # FST stuff:
 numfstdir: exp/chain/graph/train
@@ -61,7 +61,7 @@ train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
 # Training parameters
-number_of_epochs: 100
+number_of_epochs: 75
 nonfinite_patience: 100
 
 # Feature parameters
@@ -72,10 +72,10 @@ subsampling: 3
 
 dynamic_batch_kwargs:
     len_key: "wav"
-    max_sample_len: !ref <sample_rate> * 30
+    max_sample_len: !ref <sample_rate> * 60
     sampler_kwargs:
-        target_batch_numel: !ref <sample_rate> * 40
-        max_batch_numel: !ref <sample_rate> * 62 
+        target_batch_numel: !ref <sample_rate> * 80
+        max_batch_numel: !ref <sample_rate> * 124
 valid_dynamic_batch_kwargs:
     len_key: "wav"
     sampler_kwargs:
@@ -85,10 +85,12 @@ valid_dynamic_batch_kwargs:
 
 train_loader_kwargs:
     num_workers: 4
-    looped_nominal_epoch: 10000
+    looped_nominal_epoch: 5000
+    batch_size: null
 prior_loader_kwargs:
     num_workers: 0
     looped_nominal_epoch: 2000
+    batch_size: null
 ckpt_interval_minutes: 30 # save checkpoint every N min
 label_smoothing: 0.1
 lr: 0.0001
@@ -166,8 +168,11 @@ modules:
     lfmmi_lin_out: !ref <lfmmi_lin_out>
     normalize: !ref <normalize>
 
-lr_annealing: !new:local.NoSchedule
-    lr: !ref <lr>
+lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr>
+    improvement_threshold: 0.0025
+    annealing_factor: 0.9
+    patient: 0
 
 opt_class: !name:torch.optim.Adam
       lr: !ref <lr> 
@@ -186,13 +191,16 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
         lfmmi_lin_out: !ref <lfmmi_lin_out>
         normalizer: !ref <normalize>
         counter: !ref <epoch_counter>
+        annealing: !ref <lr_annealing>
 
-#ckpt_finder: !new:speechbrain.utils.checkpoints.Checkpointer
-#    checkpoints_dir: !ref <pretrain_from>/save
 
-#pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
-#collect_in: !ref <output_folder>/pretraining_files
-#    loadables:
-#        encoder: !ref <encoder>
-#        lin_out: !ref <xent_lin_out> 
-#        normalizer: !ref <normalize> 
+ckpt_finder: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <pretrain_from>/save
+
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+    collect_in: !ref <output_folder>/pretraining_files
+    loadables:
+        encoder: !ref <encoder>
+        xent_lin_out: !ref <xent_lin_out>
+        lfmmi_lin_out: !ref <lfmmi_lin_out>
+        normalizer: !ref <normalize>

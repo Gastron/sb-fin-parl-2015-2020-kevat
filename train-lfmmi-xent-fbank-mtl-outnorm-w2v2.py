@@ -23,9 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+
 # Brain class for speech recognition training
 class LFMMIAM(sb.Brain):
-
     def __init__(self, train_fsts={}, threadpool_workers=4, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_fsts = train_fsts
@@ -33,9 +33,19 @@ class LFMMIAM(sb.Brain):
 
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
-        feats = (self.hparams.compute_features(batch.wav.data)).detach()
-        normalized = self.modules.normalize(feats, lengths=batch.wav.lengths)
-        encoded = self.modules.encoder(normalized)
+        wavs, wav_lens = batch.wav
+        # Add augmentation if specified
+        if stage == sb.Stage.TRAIN:
+            if hasattr(self.modules, "env_corrupt"):
+                wavs = self.modules.env_corrupt(wavs, wav_lens)
+        feats = self.modules.wav2vec2(wavs)
+        if self.hparams.subsampling == 2:
+            pass
+        elif self.hparams.subsampling == 3:
+            feats = torch.repeat_interleave(feats,2,dim=1)[:,::self.hparams.subsampling,:]
+        elif self.hparams.subsampling == 4:
+            feats = feats[:,::2,:]
+        encoded = self.modules.encoder(feats)
         lfmmi_out = self.modules.lfmmi_lin_out(encoded)
         xent_out = self.modules.xent_lin_out(encoded)
         xent_predictions = self.hparams.log_softmax(xent_out)
@@ -103,12 +113,14 @@ class LFMMIAM(sb.Brain):
         if stage == sb.Stage.VALID:
 
             # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["loss"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
+            old_lr_model, new_lr_model = self.hparams.lr_annealing_model(stage_stats["loss"])
+            sb.nnet.schedulers.update_learning_rate(self.model_optimizer, new_lr_model)
+            old_lr_w2v, new_lr_w2v = self.hparams.lr_annealing_wav2vec(stage_stats["loss"])
+            sb.nnet.schedulers.update_learning_rate(self.wav2vec_optimizer, new_lr_w2v)
 
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": old_lr},
+                stats_meta={"epoch": epoch, "lr_model": old_lr_model, "lr_w2v": old_lr_w2v},
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
             )
@@ -126,6 +138,42 @@ class LFMMIAM(sb.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
+
+    def init_optimizers(self):
+        "Initializes the wav2vec2 optimizer and model optimizer"
+        if not self.hparams.wav2vec2.freeze:
+            self.wav2vec_optimizer = self.hparams.wav2vec_opt_class(
+                self.modules.wav2vec2.parameters()
+            )
+            if self.checkpointer is not None:
+                self.checkpointer.add_recoverable(
+                    "wav2vec_opt", self.wav2vec_optimizer
+                )
+        self.model_optimizer = self.hparams.model_opt_class(
+            self.hparams.model.parameters()
+        )
+
+        if self.checkpointer is not None:
+            self.checkpointer.add_recoverable("modelopt", self.model_optimizer)
+
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        should_step = self.step % self.hparams.grad_accumulation_factor == 0
+        outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+        (loss / self.hparams.grad_accumulation_factor).backward()
+
+        if should_step:
+            if self.check_gradients(loss):
+                if not self.hparams.wav2vec2.freeze:
+                    self.wav2vec_optimizer.step()
+                self.model_optimizer.step()
+        
+            if not self.hparams.wav2vec2.freeze:
+                self.wav2vec_optimizer.zero_grad()
+            self.model_optimizer.zero_grad()
+
+        return loss.detach()
 
     def on_evaluate_start(self, max_key=None, min_key=None):
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
@@ -172,12 +220,9 @@ def numfsts_to_local_tmp(fstdir, tmpdir):
         with open(scpfile) as fin:
             for line in fin:
                 uttid, data = line.strip().split()
-                # HACK: WebDataset cannot handle periods in uttids:
-                uttid = uttid.replace(".", "")
                 arkpath, offset = data.split(":")
-                arkpath = pathlib.Path(arkpath)
-                newpath = tmpdir / arkpath.name
-                numfsts[uttid] = (str(newpath), int(offset))
+                newpath = arkpath.replace(str(fstdir), str(tmpdir))
+                numfsts[uttid] = (newpath, int(offset))
     return numfsts
 
 def dataio_prepare(hparams, numfsts):
@@ -197,7 +242,7 @@ def dataio_prepare(hparams, numfsts):
         Dictionary containing "train", "valid", and "test" keys mapping to 
         WebDataset datasets dataloaders for them.
     """
-    def load_valid_fst(sample, numfsts=numfsts):
+    def load_valid_fst(sample):
         uttid = sample["__key__"]
         fstpath, offset = numfsts["valid"][uttid]
         sample["graph"] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
@@ -258,12 +303,6 @@ if __name__ == "__main__":
             batch_size=None
     )
 
-    # Then we can copy the train FSTs into memory:
-    #TRAIN_FSTS = {}
-    #print("Reading training FSTs to memory")
-    #for uttid, (fstpath, offset) in tqdm.tqdm(numfsts["train"].items()):
-    #    TRAIN_FSTS[uttid] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
-
     # Pretrain if defined:
     if "pretrainer" in hparams:
         if "pretrain_max_key" in hparams:
@@ -278,7 +317,6 @@ if __name__ == "__main__":
     # Trainer initialization
     asr_brain = LFMMIAM(
         modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],

@@ -13,82 +13,59 @@ import webdataset as wds
 from glob import glob
 import io
 import torchaudio
-import local
 import tqdm
 from pychain import ChainGraph, ChainGraphBatch 
 import simplefst
 import pathlib
 
-from concurrent.futures import ThreadPoolExecutor
-
 logger = logging.getLogger(__name__)
+
 
 # Brain class for speech recognition training
 class LFMMIAM(sb.Brain):
-
-    def __init__(self, train_fsts={}, threadpool_workers=4, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.train_fsts = train_fsts
-        self.executor = ThreadPoolExecutor(max_workers = threadpool_workers)
-
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
-        feats = (self.hparams.compute_features(batch.wav.data)).detach()
-        normalized = self.modules.normalize(feats, lengths=batch.wav.lengths)
-        encoded = self.modules.encoder(normalized)
-        lfmmi_out = self.modules.lfmmi_lin_out(encoded)
-        xent_out = self.modules.xent_lin_out(encoded)
-        xent_predictions = self.hparams.log_softmax(xent_out)
-        return lfmmi_out, xent_predictions
+        wavs, wav_lens = batch.wav
+        # Add augmentation if specified
+        if stage == sb.Stage.TRAIN:
+            if hasattr(self.modules, "env_corrupt"):
+                wavs = self.modules.env_corrupt(wavs, wav_lens)
 
-    def load_graph(self, uttid):
-        try:
-            fstpath, offset = self.train_fsts[uttid]
-            return ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
-        except:
-            return None
+        feats = self.modules.wav2vec2(wavs)
+        if self.hparams.subsampling == 2:
+            pass
+        elif self.hparams.subsampling == 3:
+            feats = torch.repeat_interleave(feats,2,dim=1)[:,::self.hparams.subsampling,:]
+        elif self.hparams.subsampling == 4:
+            feats = feats[:,::2,:]
+        encoded = self.modules.enc(feats)
+        lfmmi_out = self.modules.lfmmi_lin_out(encoded)
+        return lfmmi_out
 
     def compute_objectives(self, predictions, batch, stage):
-        lfmmi_out, xent_predictions = predictions
-        # Get the grahps:
-        if stage == sb.Stage.TRAIN:
-            futures = []
-            for uttid in batch.__key__:
-                futures.append(self.executor.submit(self.load_graph, uttid))
-            graphs = []
-            for future in futures:
-                result = future.result()
-                graphs.append(result)
-                if result is None:
-                    raise ValueError("Empty Graph I GUESS")
-        else:
-            graphs = batch.graph
-        num_transitions = list(map(self.hparams.transgetter, graphs))
-        output_lengths = (lfmmi_out.shape[1] * batch.wav.lengths).int().cpu()
-        max_num_states = max(map(self.hparams.stategetter, graphs))
+        graphs = batch.graph
+        wavs, wav_lens = batch.wav
+        if stage == sb.Stage.TRAIN and hasattr(self.modules, "env_corrupt"):
+            pass
+            #graphs = graphs + graphs
+            #alis = torch.cat([alis, alis], dim=0)
+            #ali_lens = torch.cat([ali_lens, ali_lens])
+            #wav_lens = torch.cat([wav_lens, wav_lens])
+        lfmmi_out = predictions
+        num_transitions = list(map(self.hparams.transgetter, batch.graph))
+        output_lengths = (lfmmi_out.shape[1] * wav_lens).int().cpu()
+        max_num_states = max(map(self.hparams.stategetter, batch.graph))
         numerator_graphs = ChainGraphBatch(
                 graphs,
                 max_num_transitions=max(num_transitions),
                 max_num_states=max_num_states
         )
         lfmmi_loss = self.hparams.chain_loss(lfmmi_out, output_lengths, numerator_graphs)
-        xent_loss = sb.nnet.losses.nll_loss(
-            log_probabilities=xent_predictions,
-            length=batch.ali.lengths,
-            targets=batch.ali.data,
-            label_smoothing=self.hparams.label_smoothing,
-        )
-        output_norm_loss = torch.linalg.norm(lfmmi_out,dim=2).mean()
-
-        loss = lfmmi_loss + self.hparams.xent_scale * xent_loss + output_norm_loss*self.hparams.outnorm_scale
-        if stage != sb.Stage.TRAIN:
-            min_length = min(xent_predictions.shape[1], batch.ali.data.shape[1])
-            self.accuracy_metric.append(xent_predictions[:,:min_length,:], batch.ali.data[:,:min_length], length=batch.ali.lengths)
-        return loss
+        return lfmmi_loss
 
     def on_stage_start(self, stage, epoch):
         if stage != sb.Stage.TRAIN:
-            self.accuracy_metric = self.hparams.accuracy_computer()
+            pass
 
     def on_stage_end(self, stage, stage_loss, epoch):
         stage_stats = {"loss": stage_loss}
@@ -97,25 +74,36 @@ class LFMMIAM(sb.Brain):
             self.train_stats = stage_stats
         # Summarize the statistics from the stage for record-keeping.
         else:
-            stage_stats["accuracy"] = self.accuracy_metric.summarize()
+            pass
 
         # Perform end-of-iteration things, like annealing, logging, etc.
         if stage == sb.Stage.VALID:
-
-            # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["loss"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-
-            # The train_logger writes a summary to stdout and to the logfile.
+            old_lr_model, new_lr_model = self.hparams.lr_annealing_model(
+                stage_stats["loss"]
+            )
+            old_lr_wav2vec, new_lr_wav2vec = self.hparams.lr_annealing_wav2vec(
+                stage_stats["loss"]
+            )
+            sb.nnet.schedulers.update_learning_rate(
+                self.model_optimizer, new_lr_model
+            )
+            if not self.hparams.wav2vec2.freeze:
+                sb.nnet.schedulers.update_learning_rate(
+                    self.wav2vec_optimizer, new_lr_wav2vec
+                )
             self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": old_lr},
+                stats_meta={
+                    "epoch": epoch,
+                    "lr_model": old_lr_model,
+                    "lr_wav2vec": old_lr_wav2vec,
+                },
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
             )
 
             # Save the current checkpoint and delete previous checkpoints.
             self.checkpointer.save_and_keep_only(
-                meta={"loss": stage_stats["loss"], "xent-accuracy": stage_stats["accuracy"]}, 
+                meta={"loss": stage_stats["loss"],}, 
                 min_keys=["loss"],
                 num_to_keep=getattr(self.hparams, "ckpts_to_keep", 1)
             )
@@ -126,6 +114,44 @@ class LFMMIAM(sb.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
+
+    def init_optimizers(self):
+        "Initializes the wav2vec2 optimizer and model optimizer"
+        if not self.hparams.wav2vec2.freeze:
+            self.wav2vec_optimizer = self.hparams.wav2vec_opt_class(
+                self.modules.wav2vec2.parameters()
+            )
+            if self.checkpointer is not None:
+                self.checkpointer.add_recoverable(
+                    "wav2vec_opt", self.wav2vec_optimizer
+                )
+        self.model_optimizer = self.hparams.model_opt_class(
+            self.hparams.model.parameters()
+        )
+
+        if self.checkpointer is not None:
+            self.checkpointer.add_recoverable("modelopt", self.model_optimizer)
+
+    
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        should_step = self.step % self.hparams.grad_accumulation_factor == 0
+        outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+        (loss / self.hparams.grad_accumulation_factor).backward()
+
+        if should_step:
+            if self.check_gradients(loss):
+                if not self.hparams.wav2vec2.freeze:
+                    self.wav2vec_optimizer.step()
+                self.model_optimizer.step()
+        
+            if not self.hparams.wav2vec2.freeze:
+                self.wav2vec_optimizer.zero_grad()
+            self.model_optimizer.zero_grad()
+
+        return loss.detach()
+
 
     def on_evaluate_start(self, max_key=None, min_key=None):
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
@@ -141,26 +167,6 @@ class LFMMIAM(sb.Brain):
             self.hparams.model.load_state_dict(model_state_dict)
             self.checkpointer.save_checkpoint(name=f"AVERAGED-{self.hparams.avg_ckpts}")
 
-    def estimate_prior_empirical(self, train_data, loader_kwargs={}, max_key=None, min_key=None):
-        self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.hparams.train_logger.log_stats(
-            stats_meta={"Epoch loaded for prior": self.hparams.epoch_counter.current},
-        )
-        dataloader = self.make_dataloader(train_data, **loader_kwargs, stage=sb.Stage.TEST)
-        with torch.no_grad():
-            prior_floor = 1.0e-15
-            prior = torch.ones((self.hparams.num_units,)) * prior_floor
-            for batch in tqdm.tqdm(dataloader):
-                lfmmi_pred, log_predictions = self.compute_forward(batch, stage=sb.Stage.TEST)
-                predictions = log_predictions.exp()
-                lengths = batch.wav.lengths*predictions.shape[1]
-                mask = sb.dataio.dataio.length_to_mask(lengths).float()
-                summed_preds = torch.sum(predictions * mask.unsqueeze(-1), dim=(0,1))
-                prior += summed_preds.detach().cpu()
-            # Normalize:
-            prior = prior / prior.sum()
-        return prior.log()
-
 def numfsts_to_local_tmp(fstdir, tmpdir):
     """Copies the chain numerator FSTs onto a local disk"""
     fstdir = pathlib.Path(fstdir)
@@ -172,12 +178,9 @@ def numfsts_to_local_tmp(fstdir, tmpdir):
         with open(scpfile) as fin:
             for line in fin:
                 uttid, data = line.strip().split()
-                # HACK: WebDataset cannot handle periods in uttids:
-                uttid = uttid.replace(".", "")
                 arkpath, offset = data.split(":")
-                arkpath = pathlib.Path(arkpath)
-                newpath = tmpdir / arkpath.name
-                numfsts[uttid] = (str(newpath), int(offset))
+                newpath = arkpath.replace(str(fstdir), str(tmpdir))
+                numfsts[uttid] = (newpath, int(offset))
     return numfsts
 
 def dataio_prepare(hparams, numfsts):
@@ -197,7 +200,21 @@ def dataio_prepare(hparams, numfsts):
         Dictionary containing "train", "valid", and "test" keys mapping to 
         WebDataset datasets dataloaders for them.
     """
-    def load_valid_fst(sample, numfsts=numfsts):
+    TRAIN_FSTS = {}
+    # READ train fsts to mem:
+    if getattr(hparams, "train_fsts_in_mem", False):
+        for uttid, (fstpath, offset) in numfsts["train"].items():
+            TRAIN_FSTS[uttid] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
+    def load_train_fst(sample):
+        uttid = sample["__key__"]
+        if uttid in TRAIN_FSTS:
+            sample["graph"] = TRAIN_FSTS[uttid] 
+        else:
+            fstpath, offset = numfsts["train"][uttid]
+            sample["graph"] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
+        return sample
+
+    def load_valid_fst(sample):
         uttid = sample["__key__"]
         fstpath, offset = numfsts["valid"][uttid]
         sample["graph"] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
@@ -206,7 +223,8 @@ def dataio_prepare(hparams, numfsts):
     traindata = (
             wds.WebDataset(hparams["trainshards"])
             .decode()
-            .rename(wav="audio.pth", ali="ali.pth")
+            .rename(wav="audio.pth")
+            .map(load_train_fst, handler=wds.warn_and_continue)
             .repeat()
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -216,7 +234,7 @@ def dataio_prepare(hparams, numfsts):
     validdata = (
             wds.WebDataset(hparams["validshards"])
             .decode()
-            .rename(wav="audio.pth", ali="ali.pth")
+            .rename(wav="audio.pth")
             .map(load_valid_fst, handler=wds.warn_and_continue)
             .then(
                 sb.dataio.iterators.dynamic_bucketed_batch,
@@ -258,12 +276,6 @@ if __name__ == "__main__":
             batch_size=None
     )
 
-    # Then we can copy the train FSTs into memory:
-    #TRAIN_FSTS = {}
-    #print("Reading training FSTs to memory")
-    #for uttid, (fstpath, offset) in tqdm.tqdm(numfsts["train"].items()):
-    #    TRAIN_FSTS[uttid] = ChainGraph(simplefst.StdVectorFst.read_ark(fstpath, offset), log_domain=True)
-
     # Pretrain if defined:
     if "pretrainer" in hparams:
         if "pretrain_max_key" in hparams:
@@ -278,11 +290,9 @@ if __name__ == "__main__":
     # Trainer initialization
     asr_brain = LFMMIAM(
         modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
-        train_fsts = numfsts["train"],
     )
 
     # The `fit()` method iterates the training loop, calling the methods
@@ -293,18 +303,5 @@ if __name__ == "__main__":
         asr_brain.hparams.epoch_counter,
         datasets["train"],
         datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+       train_loader_kwargs = hparams["train_loader_kwargs"]
     )
-    
-    if "prior_file" in hparams:
-        kwargs = {}
-        if "test_max_key" in hparams:
-            kwargs["max_key"] = hparams["test_max_key"]
-        elif "test_min_key" in hparams:
-            kwargs["min_key"] = hparams["test_min_key"]
-        prior = asr_brain.estimate_prior_empirical(
-                datasets["train"], 
-                loader_kwargs=hparams["prior_loader_kwargs"],
-                **kwargs
-        )
-        torch.save(prior, hparams["prior_file"])

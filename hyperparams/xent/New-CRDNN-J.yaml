@@ -15,37 +15,9 @@ num_utts_train: 1109736
 validshards: ./dev-shards-wav-ali/shard-00000{0..1}.tar
 # data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
 num_units: 2328
-output_folder: !ref exp/mtl-am/New-CRDNN-J/<seed>-<num_units>units
+output_folder: !ref exp/xent-am/New-CRDNN-J/<seed>-<num_units>units
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
-
-#pretrain_from: exp/xent-am/CRDNN-D/2602-2328units
-
-# FST stuff:
-numfstdir: exp/chain/graph/train
-numfsttmpdir: /tmp/sb-train-fsts 
-valid_numfstdir: exp/chain/graph/parl-dev-all-fixed
-valid_numfsttmpdir: /tmp/sb-parl-dev-all-fsts
-denominator_graph: !new:pychain.graph.ChainGraph
-    fst: !apply:simplefst.StdVectorFst.read
-        - exp/chain/graph/den.fst
-    initial_mode: leaky
-    final_mode: ones 
-
-chain_loss: !new:pychain.loss.ChainLoss
-    - !ref <denominator_graph>
-    - 0.0001
-train_fsts_in_mem: True
-# FST Helpers:
-transgetter: !new:operator.attrgetter
-    - "num_transitions"
-stategetter: !new:operator.attrgetter
-    - "num_states"
-
-# Multi-task weighting:
-xent_scale: 0.1
-lin_out_name: "lfmmi_lin_out"
-outnorm_scale: 0.0005
 
 # Test files:
 prior_file: !ref <output_folder>/prior.pth
@@ -54,7 +26,6 @@ test_min_key: "loss"
 testdir: kaldi-s5/data/parl-dev-all-fixed_hires/
 test_probs_out: !ref <output_folder>/test_probs.ark
 subtract_prior: True
-normalize_out: False
 
 # The train logger writes training statistics to a file, as well as stdout.
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
@@ -84,7 +55,7 @@ valid_dynamic_batch_kwargs:
     max_sample_len: !ref <sample_rate> * 25
 
 train_loader_kwargs:
-    num_workers: 4
+    num_workers: 6
     looped_nominal_epoch: 10000
 prior_loader_kwargs:
     num_workers: 0
@@ -150,9 +121,6 @@ encoder: !new:speechbrain.lobes.models.CRDNN.CRDNN
 xent_lin_out: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <dnn_neurons>
     n_neurons: !ref <num_units>
-lfmmi_lin_out: !new:speechbrain.nnet.linear.Linear
-    input_size: !ref <dnn_neurons>
-    n_neurons: !ref <num_units>
 
 # Final softmax (for log posteriors computation).
 log_softmax: !new:speechbrain.nnet.activations.Softmax
@@ -163,7 +131,6 @@ log_softmax: !new:speechbrain.nnet.activations.Softmax
 modules:
     encoder: !ref <encoder>
     xent_lin_out: !ref <xent_lin_out>
-    lfmmi_lin_out: !ref <lfmmi_lin_out>
     normalize: !ref <normalize>
 
 lr_annealing: !new:local.NoSchedule
@@ -183,7 +150,6 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     recoverables:
         encoder: !ref <encoder>
         xent_lin_out: !ref <xent_lin_out>
-        lfmmi_lin_out: !ref <lfmmi_lin_out>
         normalizer: !ref <normalize>
         counter: !ref <epoch_counter>
 

@@ -57,22 +57,26 @@ def run_test(modules, hparams, device):
     else:
         num_utts = count_scp_lines(testdir / "wav.scp")
         data_iter = wavscp_to_output(testdir / "wav.scp")
-    lin_out_name = getattr(hparams, "lin_out_name", "lfmmi_lin_out")
-    lin_out = getattr(modules, lin_out_name)
     with open(hparams.test_probs_out, 'wb') as fo:
         with torch.no_grad():
             for uttid, data in tqdm.tqdm(data_iter, total=num_utts):
                 audio = data["audio.pth"].to(device).unsqueeze(0)
-                feats = hparams.compute_features(audio)
-                normalized = modules.normalize(feats, lengths=torch.tensor([1.]), epoch=1000)
-                encoded = modules.encoder(normalized)
-                out = lin_out(encoded)
-                if lin_out_name == "xent_lin_out": 
-                    out = hparams.log_softmax(out)
-                    if getattr(hparams, "subtract_prior", True):
-                        out -= prior
-                elif getattr(hparams, "normalize_out", False):
-                    out = hparams.log_softmax(out)
+                feats = modules.wav2vec2(audio)
+                if hparams.subsampling == 2:
+                    pass
+                elif hparams.subsampling == 3:
+                    feats = torch.repeat_interleave(feats,2,dim=1)[:,::hparams.subsampling,:]
+                elif hparams.subsampling == 4:
+                    feats = feats[:,::2,:]
+                encoded = modules.encoder(feats)
+                lfmmi_out = modules.lfmmi_lin_out(encoded)
+                lfmmi_preds = hparams.log_softmax(lfmmi_out)
+                xent_out = modules.xent_lin_out(encoded)
+                if getattr(hparams, "subtract_prior", True):
+                    xent_preds = hparams.log_softmax(xent_out) - prior
+                else:
+                    xent_preds = hparams.log_softmax(xent_out)
+                out = lfmmi_preds*(1-hparams.xent_scale) + hparams.xent_scale*xent_preds
                 kaldi_io.write_mat(fo, out.squeeze(0).cpu().numpy(), key=uttid)
     
 
@@ -86,4 +90,3 @@ if __name__ == "__main__":
 
     modules, hparams, device = setup(hparams, run_opts)
     run_test(modules, hparams, device)
-

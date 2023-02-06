@@ -57,8 +57,6 @@ def run_test(modules, hparams, device):
     else:
         num_utts = count_scp_lines(testdir / "wav.scp")
         data_iter = wavscp_to_output(testdir / "wav.scp")
-    lin_out_name = getattr(hparams, "lin_out_name", "lfmmi_lin_out")
-    lin_out = getattr(modules, lin_out_name)
     with open(hparams.test_probs_out, 'wb') as fo:
         with torch.no_grad():
             for uttid, data in tqdm.tqdm(data_iter, total=num_utts):
@@ -66,13 +64,10 @@ def run_test(modules, hparams, device):
                 feats = hparams.compute_features(audio)
                 normalized = modules.normalize(feats, lengths=torch.tensor([1.]), epoch=1000)
                 encoded = modules.encoder(normalized)
-                out = lin_out(encoded)
-                if lin_out_name == "xent_lin_out": 
-                    out = hparams.log_softmax(out)
-                    if getattr(hparams, "subtract_prior", True):
-                        out -= prior
-                elif getattr(hparams, "normalize_out", False):
-                    out = hparams.log_softmax(out)
+                out = modules.xent_lin_out(encoded)
+                out = hparams.log_softmax(out)
+                if getattr(hparams, "subtract_prior", True):
+                    out -= prior
                 kaldi_io.write_mat(fo, out.squeeze(0).cpu().numpy(), key=uttid)
     
 
