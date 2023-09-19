@@ -2,7 +2,7 @@
 set -eu -o pipefail
 
 LMWT=13
-num_best=50
+num_best=100
 cmd=run.pl
 
 echo "$0 $@"  # Print the command line for logging
@@ -36,3 +36,4 @@ cat "$outdir"/lm_cost.* >"$outdir"/lm_cost && rm "$outdir"/lm_cost.*
 cat "$outdir"/text.* > "$outdir"/text && rm "$outdir"/text.*
 cat "$outdir"/ac_cost.* > "$outdir"/ac_cost && rm "$outdir"/ac_cost.*
 echo "Done getting $num_best-best transcripts with acoustic costs, output in $outdir"
+

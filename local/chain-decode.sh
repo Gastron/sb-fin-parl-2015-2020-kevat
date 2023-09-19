@@ -2,7 +2,7 @@
 # Script to test 
 
 am_cmd="srun --gres=gpu:1 --constraint=volta --time 1:0:0 --mem 32G -p dgx-common,dgx-spa,gpu,gpushort"
-decode_cmd="slurm.pl --mem 12G --time 4:0:0"
+decode_cmd="slurm.pl --mem 24G --time 4:0:0"
 score_cmd="slurm.pl --mem 2G --time 0:30:0"
 nj=8
 hparams="hyperparams/mtl/New-CRDNN-H.yaml"
